@@ -60,6 +60,10 @@ deliverable.
   into app team namespaces via `PushSecret` or `ClusterExternalSecret`.
   App team Deployments mount a plain K8s Secret; they never interact with
   Crossplane or Vault directly.
+- **KEDA** (via Helm, `kedacore/keda`) — must be installed before the
+  Composition runs; the `ScaledObject` CRD must exist for provider-kubernetes
+  to create it. Uses KEDA's built-in `kafka` trigger type with SASL_SSL for
+  Confluent Cloud consumer lag scaling.
 - **kind** (or any disposable local cluster) — do not point this at a
   production GKE cluster
 - A **sandbox Confluent Cloud environment** — never the team's real
@@ -131,12 +135,28 @@ docs/
    ```
 5. `kubectl get providers` until both report `INSTALLED=True HEALTHY=True`;
    `kubectl get functions` until `function-patch-and-transform` also reports healthy.
-6. Create a `ProviderConfig` for `provider-confluent` referencing the
+6. Install KEDA — must exist before the Composition runs so the `ScaledObject`
+   CRD is present when provider-kubernetes tries to create it:
+   ```bash
+   helm repo add kedacore https://kedacore.github.io/charts
+   helm repo update
+   helm install keda kedacore/keda --namespace keda --create-namespace
+   kubectl wait --for=condition=ready pod -l app=keda-operator -n keda --timeout=120s
+   ```
+7. Apply the provider-kubernetes RBAC extension so it can manage ScaledObjects,
+   NetworkPolicies, and PodDisruptionBudgets:
+   ```bash
+   kubectl apply -f crossplane/provider/provider-kubernetes-rbac.yaml
+   ```
+   The ClusterRoleBinding targets `system:serviceaccounts:crossplane-system`
+   (all SAs in that namespace) so it survives provider upgrades that rotate
+   the SA name suffix.
+8. Create a `ProviderConfig` for `provider-confluent` referencing the
    `confluent-credentials` secret seeded by `confluent-up.sh` in step 2.
-7. Create a `ProviderConfig` for `provider-kubernetes` pointing at the same
+9. Create a `ProviderConfig` for `provider-kubernetes` pointing at the same
    in-cluster kubeconfig (we're applying K8s resources to the same kind
    cluster the Composition runs in, not a remote one — keep this simple).
-8. Install Vault in dev mode and ESO:
+10. Install Vault in dev mode and ESO:
    ```bash
    helm install vault hashicorp/vault --set server.dev.enabled=true -n vault --create-namespace
    helm install external-secrets external-secrets/external-secrets -n external-secrets --create-namespace
@@ -146,7 +166,7 @@ docs/
    (`vault kv put secret/confluent api-key=... api-secret=...`).
    Create an `ExternalSecret` in the app team namespace that pulls from
    this path — the Deployment mounts it as a normal Secret.
-8. Install Argo CD and configure `argocd-cm` **before** applying any Application:
+11. Install Argo CD and configure `argocd-cm` **before** applying any Application:
    ```yaml
    # argocd-cm ConfigMap patch
    application.resourceTrackingMethod: annotation
