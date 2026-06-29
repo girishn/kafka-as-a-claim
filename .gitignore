@@ -1,0 +1,9 @@
+# Confluent CLI state — contains resource IDs, never commit
+scripts/.confluent-state
+
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars
+.terraform.lock.hcl
