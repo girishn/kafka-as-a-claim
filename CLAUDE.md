@@ -48,9 +48,10 @@ deliverable.
   `spec.forProvider.manifest`. This is how we'll create the KEDA
   ScaledObject, NetworkPolicy, and PodDisruptionBudget — there's no
   typed CRD for any of those, just this wrapper.
-- **Argo CD** — GitOps delivery; one `Application` watching this repo's
-  `crossplane/claims/` path. Must be configured with annotation-based
-  resource tracking and `ProviderConfigUsage` exclusions — see Setup.
+- **Argo CD** — GitOps delivery; one `Application` watching
+  `https://github.com/girishn/kafka-as-a-claim` at path `crossplane/claims/`.
+  Must be configured with annotation-based resource tracking and
+  `ProviderConfigUsage` exclusions — see Setup.
 - **HashiCorp Vault** (dev mode, in-cluster via Helm) — secret backend for
   the POC. Dev mode needs no persistent storage, no unsealing, and starts
   with a fixed root token — appropriate for kind.
