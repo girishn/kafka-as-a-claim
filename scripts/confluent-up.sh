@@ -58,13 +58,13 @@ CLUSTER_OUTPUT=$(confluent kafka cluster create "$CLUSTER_NAME" \
 CLUSTER_ID=$(echo "$CLUSTER_OUTPUT" | jq -r '.id')
 echo "    cluster_id = $CLUSTER_ID"
 
-echo "==> Waiting for cluster to become RUNNING (may take 2–3 minutes)..."
+echo "==> Waiting for cluster to become UP (may take 2–3 minutes)..."
 while true; do
   STATUS=$(confluent kafka cluster describe "$CLUSTER_ID" \
     --environment "$ENV_ID" \
-    --output json | jq -r '.status.phase')
+    --output json | jq -r '.status')
   echo "    status = $STATUS"
-  [[ "$STATUS" == "RUNNING" ]] && break
+  [[ "$STATUS" == "UP" ]] && break
   sleep 15
 done
 
@@ -117,6 +117,6 @@ echo "  Secret         : confluent-credentials (namespace: $K8S_NAMESPACE)"
 echo ""
 echo "  Bootstrap endpoint:"
 confluent kafka cluster describe "$CLUSTER_ID" --environment "$ENV_ID" --output json \
-  | jq -r '"  " + .spec.kafka_bootstrap_endpoint'
+  | jq -r '"  " + .endpoint'
 echo ""
 echo "  Next: apply crossplane/provider/ manifests and proceed with the POC."
