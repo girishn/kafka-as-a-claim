@@ -75,12 +75,12 @@ deliverable.
 
 ```
 scripts/
-  confluent.sh          # Unified provision/destroy script.
-                        #   bash scripts/confluent.sh up   — create env, cluster, SA, API key,
+  poc.sh          # Unified provision/destroy script.
+                        #   bash scripts/poc.sh up   — create env, cluster, SA, API key,
                         #                                    seed kubectl secret, save state
-                        #   bash scripts/confluent.sh down — destroy everything in reverse order
-  .confluent-state      # Written by confluent.sh up — gitignored
-  .confluent-state.example  # Example of the state file format
+                        #   bash scripts/poc.sh down — destroy everything in reverse order
+  .poc-state      # Written by poc.sh up — gitignored
+  .poc-state.example  # Example of the state file format
 crossplane/
   provider/             # Provider + ProviderConfig manifests (both providers)
   composition/          # The XRD + Composition (the only thing we "build")
@@ -95,91 +95,36 @@ docs/
 ## Setup
 
 1. `kind create cluster --name kafka-claim-poc`
-2. Provision Confluent Cloud resources and seed the cluster secret:
+2. Provision everything — Confluent Cloud + full K8s stack:
    ```bash
    confluent login
-   bash scripts/confluent.sh up
-   # Creates: environment, Basic cluster, service account, EnvironmentAdmin
-   # role binding, Cloud API key. Writes IDs to scripts/.confluent-state.
-   # Seeds: kubectl secret confluent-credentials -n crossplane-system
+   bash scripts/poc.sh up
    ```
-   Teardown when done: `bash scripts/confluent.sh down`
-3. Install Crossplane via Helm into `crossplane-system`
-4. Install both providers and the patch-and-transform function declaratively:
-   ```yaml
-   apiVersion: pkg.crossplane.io/v1
-   kind: Provider
-   metadata:
-     name: provider-confluent
-   spec:
-     package: xpkg.upbound.io/crossplane-contrib/provider-confluent:v1.0.0
-   ---
-   apiVersion: pkg.crossplane.io/v1
-   kind: Provider
-   metadata:
-     name: provider-kubernetes
-   spec:
-     package: xpkg.upbound.io/crossplane-contrib/provider-kubernetes:<latest>
-   ---
-   apiVersion: pkg.crossplane.io/v1beta1
-   kind: Function
-   metadata:
-     name: function-patch-and-transform
-   spec:
-     package: xpkg.upbound.io/crossplane-contrib/function-patch-and-transform:<latest>
-   ```
-5. `kubectl get providers` until both report `INSTALLED=True HEALTHY=True`;
-   `kubectl get functions` until `function-patch-and-transform` also reports healthy.
-6. Install KEDA — must exist before the Composition runs so the `ScaledObject`
-   CRD is present when provider-kubernetes tries to create it:
+   This single script handles (in order):
+   - Confluent Cloud: environment, Basic cluster, SA, API key, `confluent-credentials` secret
+   - Crossplane v2.x (latest stable) via Helm; providers + function applied and waited on
+   - KEDA (ScaledObject CRD must exist before the Composition runs)
+   - provider-kubernetes RBAC extension for ScaledObject/NetworkPolicy/PDB/ESO
+   - Vault (dev mode) + ESO; vault-token secret and ClusterSecretStore applied
+   - XRD + Composition
+   - Argo CD with annotation-based tracking and ProviderConfigUsage exclusions baked in;
+     `gitops/argocd-app.yaml` applied
+
+   If the state file already exists (Confluent Cloud was provisioned in a prior run),
+   `up` skips Confluent Cloud and re-applies the K8s stack idempotently.
+
+   Teardown: `bash scripts/poc.sh down`
+
+3. Push to git so Argo CD syncs the claim:
    ```bash
-   helm repo add kedacore https://kedacore.github.io/charts
-   helm repo update
-   helm install keda kedacore/keda --namespace keda --create-namespace
-   kubectl wait --for=condition=ready pod -l app=keda-operator -n keda --timeout=120s
+   git push origin master
+   # Argo CD picks up crossplane/claims/ and applies the KafkaTopicClaim.
+   # Crossplane cascades: Confluent topic + SA + APIKey + KEDA ScaledObject + ESO secrets.
    ```
-7. Apply the provider-kubernetes RBAC extension so it can manage ScaledObjects,
-   NetworkPolicies, PodDisruptionBudgets, and ESO ExternalSecrets/PushSecrets:
+   Or apply directly for debugging (bypasses GitOps):
    ```bash
-   kubectl apply -f crossplane/provider/provider-kubernetes-rbac.yaml
+   kubectl apply -f crossplane/claims/
    ```
-   The ClusterRoleBinding targets `system:serviceaccounts:crossplane-system`
-   (all SAs in that namespace) so it survives provider upgrades that rotate
-   the SA name suffix.
-8. Create a `ProviderConfig` for `provider-confluent` referencing the
-   `confluent-credentials` secret (Cloud API key) seeded by `confluent.sh up`
-   in step 2. The Kafka-scoped API key for topic/schema operations is created
-   by the Composition itself — confirm the exact ProviderConfig shape via Step 0
-   (`kubectl explain providerconfig.confluent.crossplane.io --recursive`).
-9. Create a `ProviderConfig` for `provider-kubernetes` pointing at the same
-   in-cluster kubeconfig (we're applying K8s resources to the same kind
-   cluster the Composition runs in, not a remote one — keep this simple).
-10. Install Vault in dev mode and ESO:
-   ```bash
-   helm install vault hashicorp/vault --set server.dev.enabled=true -n vault --create-namespace
-   helm install external-secrets external-secrets/external-secrets -n external-secrets --create-namespace
-   ```
-   Configure a `ClusterSecretStore` pointing at `vault.vault.svc.cluster.local:8200`
-   with the dev root token. The `PushSecret` and `ExternalSecret` for each
-   claim are generated by the Composition (not static manifests) — the
-   Deployment in `team-payments` mounts the resulting Secret with no
-   Crossplane or Vault knowledge required.
-11. Install Argo CD and configure `argocd-cm` **before** applying any Application:
-   ```yaml
-   # argocd-cm ConfigMap patch
-   application.resourceTrackingMethod: annotation
-   resource.exclusions: |
-     - apiGroups:
-       - "*.crossplane.io"
-       - "*.upbound.io"
-       kinds:
-       - ProviderConfigUsage
-       clusters:
-       - "*"
-   ```
-   Then apply `gitops/argocd-app.yaml`, pointing at this repo's
-   `crossplane/claims/` path with
-   `syncPolicy.automated: { prune: true, selfHeal: true }`.
 
 ## Step 0 — discover before you build anything
 

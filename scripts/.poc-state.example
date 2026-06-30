@@ -1,4 +1,4 @@
-# IDs written by confluent-up.sh — do not edit by hand
+# IDs written by poc.sh up — do not edit by hand
 ENV_ID=env-xxxxxx
 CLUSTER_ID=lkc-xxxxxx
 SA_ID=sa-xxxxxx

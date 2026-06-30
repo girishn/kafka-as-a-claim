@@ -1,5 +1,5 @@
-# Confluent CLI state — contains resource IDs, never commit
-scripts/.confluent-state
+# POC state — contains Confluent Cloud resource IDs, never commit
+scripts/.poc-state
 
 # Claude Code local settings — machine-specific, not project config
 .claude/settings.local.json
