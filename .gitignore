@@ -1,6 +1,9 @@
 # Confluent CLI state — contains resource IDs, never commit
 scripts/.confluent-state
 
+# Claude Code local settings — machine-specific, not project config
+.claude/settings.local.json
+
 # Terraform
 **/.terraform/
 *.tfstate
