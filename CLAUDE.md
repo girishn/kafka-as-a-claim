@@ -74,12 +74,6 @@ deliverable.
 ## Repo layout
 
 ```
-terraform/
-  bootstrap/            # S3 bucket + DynamoDB for Terraform remote state (one-time)
-    versions.tf
-    variables.tf        # bucket_name, region, dynamodb_table_name
-    main.tf             # S3 bucket (versioned, encrypted), DynamoDB lock table
-    outputs.tf          # Prints the backend block to paste elsewhere
 scripts/
   confluent-up.sh       # Creates Confluent Cloud env + cluster + SA + API key,
                         # waits for RUNNING, seeds kubectl secret. Saves IDs to
