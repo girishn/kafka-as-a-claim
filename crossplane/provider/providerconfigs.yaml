@@ -1,0 +1,25 @@
+# ProviderConfig for provider-confluent.
+# Credentials are a JSON blob: {"cloud_api_key":"...","cloud_api_secret":"..."}
+# seeded into the confluent-credentials Secret by scripts/confluent-up.sh.
+apiVersion: confluent.crossplane.io/v1beta1
+kind: ProviderConfig
+metadata:
+  name: default
+spec:
+  credentials:
+    source: Secret
+    secretRef:
+      namespace: crossplane-system
+      name: confluent-credentials
+      key: credentials
+---
+# ProviderConfig for provider-kubernetes.
+# Uses InjectedIdentity (the provider pod's own ServiceAccount) to manage
+# resources in the same cluster — no kubeconfig needed.
+apiVersion: kubernetes.crossplane.io/v1alpha1
+kind: ProviderConfig
+metadata:
+  name: default
+spec:
+  credentials:
+    source: InjectedIdentity
