@@ -75,12 +75,11 @@ deliverable.
 
 ```
 scripts/
-  confluent-up.sh       # Creates Confluent Cloud env + cluster + SA + API key,
-                        # waits for RUNNING, seeds kubectl secret. Saves IDs to
-                        # .confluent-state for teardown.
-  confluent-down.sh     # Reads .confluent-state, destroys all resources in reverse
-                        # order (key → SA → cluster → env), cleans kubectl secret.
-  .confluent-state      # Written by confluent-up.sh — gitignored
+  confluent.sh          # Unified provision/destroy script.
+                        #   bash scripts/confluent.sh up   — create env, cluster, SA, API key,
+                        #                                    seed kubectl secret, save state
+                        #   bash scripts/confluent.sh down — destroy everything in reverse order
+  .confluent-state      # Written by confluent.sh up — gitignored
   .confluent-state.example  # Example of the state file format
 crossplane/
   provider/             # Provider + ProviderConfig manifests (both providers)
@@ -99,12 +98,12 @@ docs/
 2. Provision Confluent Cloud resources and seed the cluster secret:
    ```bash
    confluent login
-   bash scripts/confluent-up.sh
+   bash scripts/confluent.sh up
    # Creates: environment, Basic cluster, service account, EnvironmentAdmin
    # role binding, Cloud API key. Writes IDs to scripts/.confluent-state.
    # Seeds: kubectl secret confluent-credentials -n crossplane-system
    ```
-   Teardown when done: `bash scripts/confluent-down.sh`
+   Teardown when done: `bash scripts/confluent.sh down`
 3. Install Crossplane via Helm into `crossplane-system`
 4. Install both providers and the patch-and-transform function declaratively:
    ```yaml
@@ -148,7 +147,7 @@ docs/
    (all SAs in that namespace) so it survives provider upgrades that rotate
    the SA name suffix.
 8. Create a `ProviderConfig` for `provider-confluent` referencing the
-   `confluent-credentials` secret (Cloud API key) seeded by `confluent-up.sh`
+   `confluent-credentials` secret (Cloud API key) seeded by `confluent.sh up`
    in step 2. The Kafka-scoped API key for topic/schema operations is created
    by the Composition itself — confirm the exact ProviderConfig shape via Step 0
    (`kubectl explain providerconfig.confluent.crossplane.io --recursive`).
