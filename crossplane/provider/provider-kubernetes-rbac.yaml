@@ -1,6 +1,6 @@
 # Grants provider-kubernetes permission to manage the non-core resources
 # the Composition creates via Object wrappers: KEDA ScaledObjects,
-# NetworkPolicies, and PodDisruptionBudgets.
+# NetworkPolicies, PodDisruptionBudgets, and ESO ExternalSecrets/PushSecrets.
 #
 # Binds to all ServiceAccounts in crossplane-system so the binding survives
 # provider upgrades (which rotate the SA name suffix).
@@ -18,6 +18,9 @@ rules:
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["keda.sh"]
     resources: ["scaledobjects", "triggerauthentications"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["external-secrets.io"]
+    resources: ["externalsecrets", "pushsecrets"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
