@@ -100,12 +100,20 @@ API_KEY_ID=${API_KEY_ID}
 STATE
 
 echo "==> Seeding Crossplane ProviderConfig secret into cluster (namespace: $K8S_NAMESPACE)"
-CREDENTIALS_JSON="{\"cloud_api_key\":\"${API_KEY}\",\"cloud_api_secret\":\"${API_SECRET}\"}"
+# --from-literal is unreliable on Windows (Git Bash strips inner quotes).
+# Use base64 + kubectl apply to guarantee the JSON is stored verbatim.
+CRED_B64=$(printf '{"cloud_api_key":"%s","cloud_api_secret":"%s"}' "${API_KEY}" "${API_SECRET}" | base64 -w0)
 kubectl create namespace "$K8S_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
-kubectl create secret generic confluent-credentials \
-  --namespace "$K8S_NAMESPACE" \
-  --from-literal=credentials="${CREDENTIALS_JSON}" \
-  --dry-run=client -o yaml | kubectl apply -f -
+kubectl apply -f - <<YAML
+apiVersion: v1
+kind: Secret
+metadata:
+  name: confluent-credentials
+  namespace: ${K8S_NAMESPACE}
+type: Opaque
+data:
+  credentials: ${CRED_B64}
+YAML
 
 echo ""
 echo "✓ Done. Confluent Cloud resources created and secret seeded."

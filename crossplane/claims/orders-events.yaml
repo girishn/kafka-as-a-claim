@@ -1,0 +1,10 @@
+apiVersion: platform.girishn.cloud/v1alpha1
+kind: KafkaTopicClaim
+metadata:
+  name: orders-events
+  namespace: team-payments
+spec:
+  topicName: orders.events
+  partitions: 6
+  consumerName: payments-consumer
+  valueSchema: orders-value-v1

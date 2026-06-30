@@ -1,0 +1,58 @@
+apiVersion: apiextensions.crossplane.io/v1
+kind: CompositeResourceDefinition
+metadata:
+  name: xkafkatopics.platform.girishn.cloud
+spec:
+  group: platform.girishn.cloud
+  names:
+    kind: XKafkaTopic
+    plural: xkafkatopics
+  claimNames:
+    kind: KafkaTopicClaim
+    plural: kafkatopiclaims
+  versions:
+    - name: v1alpha1
+      served: true
+      referenceable: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                topicName:
+                  type: string
+                  description: "Kafka topic name (e.g., orders.events)"
+                partitions:
+                  type: integer
+                  default: 6
+                  description: "Number of partitions"
+                consumerName:
+                  type: string
+                  description: "Consumer identifier — used for the Confluent SA displayName, KEDA ScaledObject, Deployment selector, NetworkPolicy, and PodDisruptionBudget"
+                valueSchema:
+                  type: string
+                  description: "Avro subject name. Schema registration is deferred to a second pass — see FINDINGS.md for Schema Registry credential complexity."
+              required:
+                - topicName
+                - partitions
+                - consumerName
+            status:
+              type: object
+              properties:
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                connectionDetails:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                provisioned:
+                  type: object
+                  description: "Values observed from provisioned resources, bridged between providers via XR status"
+                  properties:
+                    partitionsCount:
+                      type: integer
+                      description: "Observed partition count from the live KafkaTopic — patched into ScaledObject maxReplicaCount"

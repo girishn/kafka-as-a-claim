@@ -1,0 +1,31 @@
+# Dummy consumer Deployment — gives KEDA ScaledObject a target to scale.
+# In production this would be the real consumer app deployed by the team.
+# Label app: payments-consumer must match spec.consumerName in the KafkaTopicClaim.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payments-consumer
+  namespace: team-payments
+  labels:
+    app: payments-consumer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: payments-consumer
+  template:
+    metadata:
+      labels:
+        app: payments-consumer
+    spec:
+      containers:
+        - name: consumer
+          image: busybox:latest
+          command: ["sh", "-c", "while true; do sleep 30; done"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 64Mi

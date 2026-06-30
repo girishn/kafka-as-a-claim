@@ -10,3 +10,4 @@ scripts/.confluent-state
 *.tfstate.backup
 *.tfvars
 .terraform.lock.hcl
+bash.exe.stackdump

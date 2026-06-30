@@ -1,0 +1,531 @@
+# Composition: KafkaTopicClaim → Confluent Cloud + Kubernetes resources
+#
+# Crossplane v2 — spec.mode: Pipeline required; no inline patches.
+# All patching is done by function-patch-and-transform in the pipeline step.
+#
+# Confluent-side resources (via provider-confluent):
+#   1. ServiceAccount     — consumer identity in Confluent Cloud
+#   2. APIKey             — Kafka-scoped key for the SA; writes connection secret
+#   3. RoleBinding        — CloudClusterAdmin on the cluster
+#      NOTE: Basic tier does NOT support DeveloperRead/DeveloperWrite (resource roles).
+#      CloudClusterAdmin is the only cluster-scoped role available. Upgrading to
+#      Standard/Dedicated tier enables scoped topic-level RBAC — see FINDINGS.md.
+#   4. KafkaTopic         — the actual topic; credentials from APIKey connection secret
+#
+# Kubernetes-side resources (via provider-kubernetes Object wrappers):
+#   5. KEDA ScaledObject  — scales consumerName Deployment on consumer lag
+#      maxReplicaCount is patched from KafkaTopic.status.atProvider.partitionsCount
+#      via a two-hop through XR status.provisioned.partitionsCount. This is the
+#      primary cross-provider patch this POC exists to validate.
+#   6. KEDA TriggerAuthentication — references the ESO-vended kafka credentials Secret
+#   7. NetworkPolicy      — placeholder (PSC requires Dedicated tier); proves Object wrapping
+#   8. PodDisruptionBudget — ensures consumerName Deployment stays available during rollouts
+#   9. ESO PushSecret     — pushes APIKey connection secret from crossplane-system into Vault
+#  10. ESO ExternalSecret — pulls from Vault into team-payments as a plain K8s Secret
+#
+# Cross-provider patch path (step 5):
+#   KafkaTopic.status.atProvider.partitionsCount
+#   → (ToCompositeFieldPath) → XR.status.provisioned.partitionsCount
+#   → (FromCompositeFieldPath, Optional) → ScaledObject.spec.maxReplicaCount
+#
+# Confluent Cloud constants embedded here (confirm with `confluent kafka cluster describe`):
+#   ORG_ID:       35eebd08-f76f-428a-83c9-e8a2dc4c9bae
+#   ENV_ID:       env-dpyn91
+#   CLUSTER_ID:   lkc-222658m
+#   REST_ENDPOINT: https://pkc-oxqxx9.us-east-1.aws.confluent.cloud:443
+#   BOOTSTRAP:    pkc-oxqxx9.us-east-1.aws.confluent.cloud:9092
+apiVersion: apiextensions.crossplane.io/v1
+kind: Composition
+metadata:
+  name: xkafkatopic.platform.girishn.cloud
+spec:
+  compositeTypeRef:
+    apiVersion: platform.girishn.cloud/v1alpha1
+    kind: XKafkaTopic
+  mode: Pipeline
+  pipeline:
+    - step: patch-and-transform
+      functionRef:
+        name: function-patch-and-transform
+      input:
+        apiVersion: pt.fn.crossplane.io/v1beta1
+        kind: Resources
+        resources:
+
+          # ── 1. Confluent Service Account ─────────────────────────────────────
+          - name: consumer-sa
+            base:
+              apiVersion: confluent.crossplane.io/v1alpha1
+              kind: ServiceAccount
+              spec:
+                forProvider:
+                  displayName: ""
+                  description: "Managed by Crossplane kafka-as-a-claim"
+                providerConfigRef:
+                  name: default
+            patches:
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.consumerName
+                toFieldPath: spec.forProvider.displayName
+
+          # ── 2. Kafka-scoped API Key ───────────────────────────────────────────
+          # Writes connection details to <xr-name>-kafka-apikey in crossplane-system.
+          # KafkaTopic (resource 4) references this secret in its credentials block.
+          # idSelector.matchControllerRef finds the SA created in step 1 (same XR owner).
+          - name: consumer-apikey
+            base:
+              apiVersion: confluent.crossplane.io/v1alpha1
+              kind: APIKey
+              spec:
+                forProvider:
+                  displayName: ""
+                  description: "Kafka API key — managed by Crossplane kafka-as-a-claim"
+                  owner:
+                    - apiVersion: "iam/v2"
+                      kind: "ServiceAccount"
+                      idSelector:
+                        matchControllerRef: true
+                  managedResource:
+                    - id: "lkc-222658m"
+                      apiVersion: "cmk/v2"
+                      kind: "Cluster"
+                      environment:
+                        - id: "env-dpyn91"
+                writeConnectionSecretToRef:
+                  namespace: crossplane-system
+                  name: ""
+                providerConfigRef:
+                  name: default
+            patches:
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.consumerName
+                toFieldPath: spec.forProvider.displayName
+                transforms:
+                  - type: string
+                    string:
+                      type: Format
+                      fmt: "%s-kafka-key"
+              - type: FromCompositeFieldPath
+                fromFieldPath: metadata.name
+                toFieldPath: spec.writeConnectionSecretToRef.name
+                transforms:
+                  - type: string
+                    string:
+                      type: Format
+                      fmt: "%s-kafka-apikey"
+
+          # ── 3. Confluent RBAC Role Binding ────────────────────────────────────
+          # principalSelector.matchControllerRef resolves to the SA from step 1.
+          # CloudClusterAdmin is the only role supported on Basic tier clusters.
+          - name: consumer-rolebinding
+            base:
+              apiVersion: confluent.crossplane.io/v1alpha1
+              kind: RoleBinding
+              spec:
+                forProvider:
+                  roleName: "CloudClusterAdmin"
+                  crnPattern: "crn://confluent.cloud/organization=35eebd08-f76f-428a-83c9-e8a2dc4c9bae/environment=env-dpyn91/cloud-cluster=lkc-222658m"
+                  principalSelector:
+                    matchControllerRef: true
+                providerConfigRef:
+                  name: default
+
+          # ── 4. Kafka Topic ────────────────────────────────────────────────────
+          # credentials block references the APIKey connection secret from step 2.
+          # The secret name is derived from the XR metadata.name (same transform
+          # used in step 2 for writeConnectionSecretToRef.name).
+          # The Topic will transiently fail until the APIKey secret exists — this
+          # is expected eventual consistency, not a bug.
+          - name: kafka-topic
+            base:
+              apiVersion: confluent.crossplane.io/v1alpha1
+              kind: KafkaTopic
+              spec:
+                forProvider:
+                  topicName: ""
+                  partitionsCount: 6
+                  restEndpoint: "https://pkc-oxqxx9.us-east-1.aws.confluent.cloud:443"
+                  kafkaCluster:
+                    - id: "lkc-222658m"
+                  credentials:
+                    - keySecretRef:
+                        namespace: crossplane-system
+                        name: ""
+                        key: api_key_id
+                      secretSecretRef:
+                        namespace: crossplane-system
+                        name: ""
+                        key: api_key_secret
+                providerConfigRef:
+                  name: default
+            patches:
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.topicName
+                toFieldPath: spec.forProvider.topicName
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.partitions
+                toFieldPath: spec.forProvider.partitionsCount
+              - type: FromCompositeFieldPath
+                fromFieldPath: metadata.name
+                toFieldPath: spec.forProvider.credentials[0].keySecretRef.name
+                transforms:
+                  - type: string
+                    string:
+                      type: Format
+                      fmt: "%s-kafka-apikey"
+              - type: FromCompositeFieldPath
+                fromFieldPath: metadata.name
+                toFieldPath: spec.forProvider.credentials[0].secretSecretRef.name
+                transforms:
+                  - type: string
+                    string:
+                      type: Format
+                      fmt: "%s-kafka-apikey"
+              # Two-hop cross-provider patch (hop 1 of 2):
+              # Observed partition count from Confluent → XR status bridge field.
+              # Hop 2 is on the ScaledObject (resource 5) below.
+              - type: ToCompositeFieldPath
+                fromFieldPath: status.atProvider.partitionsCount
+                toFieldPath: status.provisioned.partitionsCount
+                policy:
+                  fromFieldPath: Optional
+
+          # ── 5. KEDA ScaledObject ──────────────────────────────────────────────
+          # maxReplicaCount is patched in two passes:
+          #   Pass A: FromCompositeFieldPath spec.partitions — immediate, from claim
+          #   Pass B: FromCompositeFieldPath status.provisioned.partitionsCount — live
+          #           from Confluent (Optional; takes effect after Topic reconciles)
+          # Pass B runs after Pass A in the same function invocation, so when the
+          # XR status field is populated it wins. This is what the POC validates.
+          - name: keda-scaled-object
+            base:
+              apiVersion: kubernetes.crossplane.io/v1alpha2
+              kind: Object
+              spec:
+                forProvider:
+                  manifest:
+                    apiVersion: keda.sh/v1alpha1
+                    kind: ScaledObject
+                    metadata:
+                      name: ""
+                      namespace: team-payments
+                    spec:
+                      scaleTargetRef:
+                        name: ""
+                      minReplicaCount: 1
+                      maxReplicaCount: 1
+                      triggers:
+                        - type: kafka
+                          authenticationRef:
+                            name: ""
+                          metadata:
+                            bootstrapServers: "pkc-oxqxx9.us-east-1.aws.confluent.cloud:9092"
+                            consumerGroup: ""
+                            topic: ""
+                            lagThreshold: "50"
+                            activationLagThreshold: "1"
+                            sasl: sasl_ssl
+                            tls: none
+                providerConfigRef:
+                  name: default
+            patches:
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.consumerName
+                toFieldPath: spec.forProvider.manifest.metadata.name
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.consumerName
+                toFieldPath: spec.forProvider.manifest.spec.scaleTargetRef.name
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.consumerName
+                toFieldPath: spec.forProvider.manifest.spec.triggers[0].authenticationRef.name
+                transforms:
+                  - type: string
+                    string:
+                      type: Format
+                      fmt: "%s-trigger-auth"
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.consumerName
+                toFieldPath: spec.forProvider.manifest.spec.triggers[0].metadata.consumerGroup
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.topicName
+                toFieldPath: spec.forProvider.manifest.spec.triggers[0].metadata.topic
+              # Pass A: set maxReplicaCount from the claim spec (immediate)
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.partitions
+                toFieldPath: spec.forProvider.manifest.spec.maxReplicaCount
+              # Pass B: override with live observed count from Confluent (after Topic reconciles)
+              - type: FromCompositeFieldPath
+                fromFieldPath: status.provisioned.partitionsCount
+                toFieldPath: spec.forProvider.manifest.spec.maxReplicaCount
+                policy:
+                  fromFieldPath: Optional
+
+          # ── 6. KEDA TriggerAuthentication ─────────────────────────────────────
+          # References the Secret vended by the ESO ExternalSecret (resource 10).
+          # The secret name <consumerName>-kafka-creds is the ExternalSecret target.
+          - name: keda-trigger-auth
+            base:
+              apiVersion: kubernetes.crossplane.io/v1alpha2
+              kind: Object
+              spec:
+                forProvider:
+                  manifest:
+                    apiVersion: keda.sh/v1alpha1
+                    kind: TriggerAuthentication
+                    metadata:
+                      name: ""
+                      namespace: team-payments
+                    spec:
+                      secretTargetRef:
+                        - parameter: username
+                          name: ""
+                          key: api_key_id
+                        - parameter: password
+                          name: ""
+                          key: api_key_secret
+                providerConfigRef:
+                  name: default
+            patches:
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.consumerName
+                toFieldPath: spec.forProvider.manifest.metadata.name
+                transforms:
+                  - type: string
+                    string:
+                      type: Format
+                      fmt: "%s-trigger-auth"
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.consumerName
+                toFieldPath: spec.forProvider.manifest.spec.secretTargetRef[0].name
+                transforms:
+                  - type: string
+                    string:
+                      type: Format
+                      fmt: "%s-kafka-creds"
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.consumerName
+                toFieldPath: spec.forProvider.manifest.spec.secretTargetRef[1].name
+                transforms:
+                  - type: string
+                    string:
+                      type: Format
+                      fmt: "%s-kafka-creds"
+
+          # ── 7. NetworkPolicy (placeholder) ────────────────────────────────────
+          # PSC private networking requires Dedicated tier — not available on Basic.
+          # This manifest proves the Object wrapping pattern works for NetworkPolicy.
+          # The egress rule allows port 9092 to any destination (permissive placeholder).
+          # See FINDINGS.md for production PSC + NetworkPolicy approach.
+          - name: network-policy
+            base:
+              apiVersion: kubernetes.crossplane.io/v1alpha2
+              kind: Object
+              spec:
+                forProvider:
+                  manifest:
+                    apiVersion: networking.k8s.io/v1
+                    kind: NetworkPolicy
+                    metadata:
+                      name: ""
+                      namespace: team-payments
+                      annotations:
+                        platform.girishn.cloud/placeholder: "true"
+                    spec:
+                      podSelector:
+                        matchLabels:
+                          app: ""
+                      policyTypes:
+                        - Egress
+                      egress:
+                        - ports:
+                            - protocol: TCP
+                              port: 9092
+                providerConfigRef:
+                  name: default
+            patches:
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.consumerName
+                toFieldPath: spec.forProvider.manifest.metadata.name
+                transforms:
+                  - type: string
+                    string:
+                      type: Format
+                      fmt: "%s-egress-confluent"
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.consumerName
+                toFieldPath: spec.forProvider.manifest.spec.podSelector.matchLabels.app
+
+          # ── 8. PodDisruptionBudget ────────────────────────────────────────────
+          - name: pod-disruption-budget
+            base:
+              apiVersion: kubernetes.crossplane.io/v1alpha2
+              kind: Object
+              spec:
+                forProvider:
+                  manifest:
+                    apiVersion: policy/v1
+                    kind: PodDisruptionBudget
+                    metadata:
+                      name: ""
+                      namespace: team-payments
+                    spec:
+                      minAvailable: 1
+                      selector:
+                        matchLabels:
+                          app: ""
+                providerConfigRef:
+                  name: default
+            patches:
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.consumerName
+                toFieldPath: spec.forProvider.manifest.metadata.name
+                transforms:
+                  - type: string
+                    string:
+                      type: Format
+                      fmt: "%s-pdb"
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.consumerName
+                toFieldPath: spec.forProvider.manifest.spec.selector.matchLabels.app
+
+          # ── 9. ESO PushSecret ─────────────────────────────────────────────────
+          # Pushes the Kafka API key from the connection secret in crossplane-system
+          # into Vault at path kafka/<xr-name>. The ClusterSecretStore (vault-cluster-store)
+          # must be configured separately before this will reconcile successfully.
+          - name: eso-push-secret
+            base:
+              apiVersion: kubernetes.crossplane.io/v1alpha2
+              kind: Object
+              spec:
+                forProvider:
+                  manifest:
+                    apiVersion: external-secrets.io/v1alpha1
+                    kind: PushSecret
+                    metadata:
+                      name: ""
+                      namespace: crossplane-system
+                    spec:
+                      refreshInterval: 1h
+                      secretStoreRefs:
+                        - name: vault-cluster-store
+                          kind: ClusterSecretStore
+                      selector:
+                        secret:
+                          name: ""
+                      data:
+                        - match:
+                            secretKey: api_key_id
+                            remoteRef:
+                              remoteKey: ""
+                              property: api_key_id
+                        - match:
+                            secretKey: api_key_secret
+                            remoteRef:
+                              remoteKey: ""
+                              property: api_key_secret
+                      updatePolicy: Replace
+                      deletionPolicy: Delete
+                providerConfigRef:
+                  name: default
+            patches:
+              - type: FromCompositeFieldPath
+                fromFieldPath: metadata.name
+                toFieldPath: spec.forProvider.manifest.metadata.name
+                transforms:
+                  - type: string
+                    string:
+                      type: Format
+                      fmt: "%s-push"
+              - type: FromCompositeFieldPath
+                fromFieldPath: metadata.name
+                toFieldPath: spec.forProvider.manifest.spec.selector.secret.name
+                transforms:
+                  - type: string
+                    string:
+                      type: Format
+                      fmt: "%s-kafka-apikey"
+              - type: FromCompositeFieldPath
+                fromFieldPath: metadata.name
+                toFieldPath: spec.forProvider.manifest.spec.data[0].match.remoteRef.remoteKey
+                transforms:
+                  - type: string
+                    string:
+                      type: Format
+                      fmt: "kafka/%s"
+              - type: FromCompositeFieldPath
+                fromFieldPath: metadata.name
+                toFieldPath: spec.forProvider.manifest.spec.data[1].match.remoteRef.remoteKey
+                transforms:
+                  - type: string
+                    string:
+                      type: Format
+                      fmt: "kafka/%s"
+
+          # ── 10. ESO ExternalSecret ────────────────────────────────────────────
+          # Pulls from Vault kafka/<xr-name> into a plain Secret in team-payments.
+          # The consumer Deployment mounts this Secret — no Crossplane or Vault
+          # knowledge required by the app team.
+          - name: eso-external-secret
+            base:
+              apiVersion: kubernetes.crossplane.io/v1alpha2
+              kind: Object
+              spec:
+                forProvider:
+                  manifest:
+                    apiVersion: external-secrets.io/v1
+                    kind: ExternalSecret
+                    metadata:
+                      name: ""
+                      namespace: team-payments
+                    spec:
+                      refreshInterval: 1h
+                      secretStoreRef:
+                        name: vault-cluster-store
+                        kind: ClusterSecretStore
+                      target:
+                        name: ""
+                        creationPolicy: Owner
+                      data:
+                        - secretKey: api_key_id
+                          remoteRef:
+                            key: ""
+                            property: api_key_id
+                        - secretKey: api_key_secret
+                          remoteRef:
+                            key: ""
+                            property: api_key_secret
+                providerConfigRef:
+                  name: default
+            patches:
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.consumerName
+                toFieldPath: spec.forProvider.manifest.metadata.name
+                transforms:
+                  - type: string
+                    string:
+                      type: Format
+                      fmt: "%s-kafka-creds"
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.consumerName
+                toFieldPath: spec.forProvider.manifest.spec.target.name
+                transforms:
+                  - type: string
+                    string:
+                      type: Format
+                      fmt: "%s-kafka-creds"
+              - type: FromCompositeFieldPath
+                fromFieldPath: metadata.name
+                toFieldPath: spec.forProvider.manifest.spec.data[0].remoteRef.key
+                transforms:
+                  - type: string
+                    string:
+                      type: Format
+                      fmt: "kafka/%s"
+              - type: FromCompositeFieldPath
+                fromFieldPath: metadata.name
+                toFieldPath: spec.forProvider.manifest.spec.data[1].remoteRef.key
+                transforms:
+                  - type: string
+                    string:
+                      type: Format
+                      fmt: "kafka/%s"
