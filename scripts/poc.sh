@@ -332,7 +332,7 @@ EOF
   echo "    kubectl apply -f crossplane/claims/"
   echo ""
   echo "  Watch reconciliation:"
-  echo "    kubectl get kafkatopiclaim -A"
+  echo "    kubectl get kafkatopiclaims -A"
   echo "    kubectl get managed -o wide"
   echo ""
   echo "  Tear everything down when done:"
