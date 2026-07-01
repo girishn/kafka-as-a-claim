@@ -149,18 +149,43 @@ cmd_up() {
 
     echo "==> Getting Schema Registry cluster details..."
     # ESSENTIALS governance package includes Schema Registry at the environment level.
-    SR_OUTPUT=$(confluent schema-registry cluster describe \
-      --environment "$ENV_ID" --output json)
-    SR_ID=$(echo "$SR_OUTPUT" | jq -r '.cluster_id // .id // empty')
-    SR_REST_ENDPOINT=$(echo "$SR_OUTPUT" | jq -r '.endpoint_url // .rest_endpoint // empty')
-    if [[ -z "$SR_ID" ]]; then
-      echo "    WARN: Could not get SR cluster ID — Schema Registry may take a moment to activate."
+    _sr_describe() {
+      confluent schema-registry cluster describe --environment "$ENV_ID" --output json 2>&1
+    }
+    _sr_extract_id() {
+      # Try every field name seen across CLI versions
+      echo "$1" | jq -r '
+        .cluster_id        // .id              //
+        .official_cluster_id // .resource_id   //
+        .schema_registry_cluster_id            //
+        (if type == "array" then .[0].id else null end) //
+        empty' 2>/dev/null
+    }
+    _sr_extract_endpoint() {
+      echo "$1" | jq -r '.endpoint_url // .rest_endpoint // .url // empty' 2>/dev/null
+    }
+
+    SR_OUTPUT=$(_sr_describe)
+    SR_ID=$(_sr_extract_id "$SR_OUTPUT")
+    SR_REST_ENDPOINT=$(_sr_extract_endpoint "$SR_OUTPUT")
+
+    if [[ -z "$SR_ID" || "$SR_ID" == "null" ]]; then
+      echo "    WARN: Could not get SR cluster ID — raw response:"
+      echo "$SR_OUTPUT" | jq '.' 2>/dev/null || echo "$SR_OUTPUT"
       echo "    Retrying in 30 seconds..."
       sleep 30
-      SR_OUTPUT=$(confluent schema-registry cluster describe \
-        --environment "$ENV_ID" --output json)
-      SR_ID=$(echo "$SR_OUTPUT" | jq -r '.cluster_id // .id')
-      SR_REST_ENDPOINT=$(echo "$SR_OUTPUT" | jq -r '.endpoint_url // .rest_endpoint')
+      SR_OUTPUT=$(_sr_describe)
+      SR_ID=$(_sr_extract_id "$SR_OUTPUT")
+      SR_REST_ENDPOINT=$(_sr_extract_endpoint "$SR_OUTPUT")
+    fi
+
+    if [[ -z "$SR_ID" || "$SR_ID" == "null" ]]; then
+      echo "ERROR: Schema Registry cluster ID could not be determined after retry."
+      echo "  Raw response:"
+      echo "$SR_OUTPUT" | jq '.' 2>/dev/null || echo "$SR_OUTPUT"
+      echo "  Hint: run 'confluent schema-registry cluster describe --environment $ENV_ID --output json'"
+      echo "  and check which field holds the lsrc-... ID, then update _sr_extract_id in poc.sh."
+      exit 1
     fi
     echo "    sr_cluster_id    = $SR_ID"
     echo "    sr_rest_endpoint = $SR_REST_ENDPOINT"
