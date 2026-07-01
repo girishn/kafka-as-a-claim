@@ -153,9 +153,9 @@ cmd_up() {
       confluent schema-registry cluster describe --environment "$ENV_ID" --output json 2>&1
     }
     _sr_extract_id() {
-      # Try every field name seen across CLI versions
+      # .cluster is the field in current Confluent CLI; keep fallbacks for older versions
       echo "$1" | jq -r '
-        .cluster_id        // .id              //
+        .cluster           // .cluster_id      // .id              //
         .official_cluster_id // .resource_id   //
         .schema_registry_cluster_id            //
         (if type == "array" then .[0].id else null end) //
