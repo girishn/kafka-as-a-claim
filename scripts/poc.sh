@@ -150,11 +150,28 @@ data:
   credentials: ${CRED_B64}
 YAML
 
-    echo ""
-    echo "  Bootstrap endpoint:"
-    confluent kafka cluster describe "$CLUSTER_ID" --environment "$ENV_ID" --output json \
-      | jq -r '"    " + .endpoint'
   fi
+
+  # ── Patch Composition with current Confluent Cloud IDs ───────────────────
+  # Runs whether this was a fresh provision or a state-file reload.
+  # Keeps composition.yaml in sync so IDs never go stale after a reprovision.
+  echo ""
+  echo "==> Patching composition.yaml with current Confluent Cloud IDs..."
+  CLUSTER_INFO=$(confluent kafka cluster describe "$CLUSTER_ID" \
+    --environment "$ENV_ID" --output json)
+  REST_ENDPOINT=$(echo "$CLUSTER_INFO" | jq -r '.rest_endpoint')
+  BOOTSTRAP=$(echo "$CLUSTER_INFO" | jq -r '.endpoint' | sed 's|SASL_SSL://||')
+
+  COMPOSITION_FILE="${REPO_DIR}/crossplane/composition/composition.yaml"
+  sed -i "s|env-[a-z0-9]*|${ENV_ID}|g"                                        "$COMPOSITION_FILE"
+  sed -i "s|lkc-[a-z0-9]*|${CLUSTER_ID}|g"                                    "$COMPOSITION_FILE"
+  sed -i 's|https://pkc-[^"]*\.confluent\.cloud:443|'"${REST_ENDPOINT}"'|g'   "$COMPOSITION_FILE"
+  sed -i 's|pkc-[^"]*\.confluent\.cloud:9092|'"${BOOTSTRAP}"'|g'              "$COMPOSITION_FILE"
+
+  echo "    ENV_ID        = $ENV_ID"
+  echo "    CLUSTER_ID    = $CLUSTER_ID"
+  echo "    REST_ENDPOINT = $REST_ENDPOINT"
+  echo "    BOOTSTRAP     = $BOOTSTRAP"
 
   # ── 2. Crossplane + Providers ─────────────────────────────────────────────
   echo ""

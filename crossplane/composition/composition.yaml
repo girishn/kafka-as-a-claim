@@ -30,8 +30,8 @@
 #
 # Confluent Cloud constants embedded here (confirm with `confluent kafka cluster describe`):
 #   ORG_ID:       35eebd08-f76f-428a-83c9-e8a2dc4c9bae
-#   ENV_ID:       env-dpy62o
-#   CLUSTER_ID:   lkc-7yym732
+#   ENV_ID:       env-66xmmj
+#   CLUSTER_ID:   lkc-81165pr
 #   REST_ENDPOINT: https://pkc-oxqxx9.us-east-1.aws.confluent.cloud:443
 #   BOOTSTRAP:    pkc-oxqxx9.us-east-1.aws.confluent.cloud:9092
 apiVersion: apiextensions.crossplane.io/v1
@@ -86,11 +86,11 @@ spec:
                       idSelector:
                         matchControllerRef: true
                   managedResource:
-                    - id: "lkc-7yym732"
+                    - id: "lkc-81165pr"
                       apiVersion: "cmk/v2"
                       kind: "Cluster"
                       environment:
-                        - id: "env-dpy62o"
+                        - id: "env-66xmmj"
                 writeConnectionSecretToRef:
                   namespace: crossplane-system
                   name: ""
@@ -124,7 +124,7 @@ spec:
               spec:
                 forProvider:
                   roleName: "CloudClusterAdmin"
-                  crnPattern: "crn://confluent.cloud/organization=35eebd08-f76f-428a-83c9-e8a2dc4c9bae/environment=env-dpy62o/cloud-cluster=lkc-7yym732"
+                  crnPattern: "crn://confluent.cloud/organization=35eebd08-f76f-428a-83c9-e8a2dc4c9bae/environment=env-66xmmj/cloud-cluster=lkc-81165pr"
                   principalSelector:
                     matchControllerRef: true
                 providerConfigRef:
@@ -146,7 +146,7 @@ spec:
                   partitionsCount: 6
                   restEndpoint: "https://pkc-oxqxx9.us-east-1.aws.confluent.cloud:443"
                   kafkaCluster:
-                    - id: "lkc-7yym732"
+                    - id: "lkc-81165pr"
                   credentials:
                     - keySecretRef:
                         namespace: crossplane-system

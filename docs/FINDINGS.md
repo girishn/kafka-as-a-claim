@@ -1,6 +1,6 @@
 # POC Findings — Kafka-as-a-Claim
 
-## Status: In Progress (core loop + ESO/Vault green; GitOps pending)
+## Status: Complete (GitOps teardown not yet exercised)
 
 ---
 
@@ -14,7 +14,7 @@
 | `kafkatopics.confluent.crossplane.io` | `KafkaTopic` | ✅ |
 | `rolebindings.confluent.crossplane.io` | `RoleBinding` | ✅ |
 | `serviceaccounts.confluent.crossplane.io` | `ServiceAccount` | ✅ |
-| `schemas.confluent.crossplane.io` | `Schema` | ✅ (but deferred — see below) |
+| `schemas.confluent.crossplane.io` | `Schema` | ✅ (deferred — see below) |
 | `environments.confluent.crossplane.io` | `Environment` | ✅ |
 | `clusters.confluent.crossplane.io` | `Cluster` | ✅ |
 
@@ -51,11 +51,27 @@ with a second RoleBinding for the consumer group:
 crn://confluent.cloud/organization=<org-id>/environment=<env-id>/cloud-cluster=<cluster-id>/kafka=<cluster-id>/group=<consumerName>-*
 ```
 
+### Service Account Display Name Uniqueness
+
+**Finding:** Confluent enforces unique SA display names within an org. If a `poc.sh down` run does not cleanly delete the SA (or if it's deleted manually but Crossplane still holds the MR), a subsequent `poc.sh up` with the same claim will hit `409 Conflict: Service name is already in use`.
+
+**Workaround:** Delete the stale SA via `confluent iam service-account delete <id> --force`, then trigger re-reconcile of the Crossplane MR via pause/unpause annotation. `poc.sh down` deletes the SA as part of its Confluent teardown sequence, so this only occurs if `down` was incomplete or skipped.
+
+**Production implication:** SA names are claim-scoped (derived from `consumerName`). This is correct behavior. The 409 is a safety guard, not a bug. Ensure `poc.sh down` always fully completes before reprovisioning the same claim name.
+
 ### APIKey Credential Chicken-and-Egg
 
 The KafkaTopic requires the APIKey's connection secret to exist before it can authenticate to Confluent. Since both are created by the same Composition, the KafkaTopic reconcile loop fails with `credentials.0.key is empty` until the APIKey finishes provisioning (~3–5 min for Confluent Cloud). This is expected eventual consistency, not a bug. Crossplane retries automatically and the KafkaTopic recovers once the secret lands.
 
 **Key confirmed:** The APIKey connection secret contains keys `api_key_id`, `api_key_secret`, and `attribute.secret`. KafkaTopic credentials reference `api_key_id` (key) and `api_key_secret` (secret).
+
+### Hardcoded Confluent IDs in Composition
+
+**Finding:** `composition.yaml` embeds ENV_ID, CLUSTER_ID, REST endpoint, and bootstrap server as literal strings. These go stale after every `poc.sh down` + `poc.sh up` cycle (each creates a new Confluent environment and cluster with new IDs). Stale IDs cause the APIKey to return 403 Forbidden and the KafkaTopic to be unreachable.
+
+**Fix implemented:** `poc.sh up` now automatically patches all four values into `composition.yaml` via `sed` after the Confluent Cloud section resolves (whether from fresh provision or state file). The file on disk is always up to date before `kubectl apply -f composition.yaml` runs.
+
+**Production implication:** In production, cluster IDs are stable (you don't reprovision). This is a POC-only operational concern. The fix is adequate for the POC lifecycle.
 
 ### Cross-Resource References via `matchControllerRef`
 
@@ -88,16 +104,16 @@ Both passes produce the same value for a normal claim. They would diverge if Con
 
 ## provider-kubernetes Object Wrapping: Confirmed Working ✅
 
-All six Kubernetes-side resources created correctly:
+All six Kubernetes-side resources created and confirmed Ready:
 
 | Resource | Status | Notes |
 |----------|--------|-------|
-| KEDA ScaledObject | ✅ Ready | `maxReplicaCount` patched from partition count |
-| KEDA TriggerAuthentication | ✅ Ready | References ESO-vended secret (not yet available) |
+| KEDA ScaledObject | ✅ Ready | `maxReplicaCount` patched from live Confluent partition count |
+| KEDA TriggerAuthentication | ✅ Ready | References ESO-vended `payments-consumer-kafka-creds` |
 | NetworkPolicy | ✅ Ready | Placeholder — PSC requires Dedicated tier |
 | PodDisruptionBudget | ✅ Ready | `minAvailable: 1` enforced |
-| ESO PushSecret | ❌ Not synced | ESO not yet installed |
-| ESO ExternalSecret | ❌ Not synced | ESO not yet installed |
+| ESO PushSecret | ✅ Synced | Confluent APIKey → Vault |
+| ESO ExternalSecret | ✅ Synced | Vault → `team-payments` Secret |
 
 **NetworkPolicy placeholder:** PSC Private Link requires Dedicated tier. The NetworkPolicy wrapping pattern is proven — the resource is created and managed by Crossplane. In production (Dedicated tier + PSC), replace the permissive `egress: any:9092` with a proper destination CIDR to the PSC endpoint. Flag this for the annotation-based platform controller layer.
 
@@ -129,11 +145,11 @@ Crossplane v2 removed inline `patches:` from Compositions. The `spec.mode: Pipel
 ```json
 {"cloud_api_key":"<key>","cloud_api_secret":"<secret>"}
 ```
-The `--from-literal` flag in `kubectl create secret` is unreliable on Windows (Git Bash strips inner quotes). The `confluent-up.sh` script was updated to use base64 + `kubectl apply -f -` to guarantee verbatim JSON.
+The `--from-literal` flag in `kubectl create secret` is unreliable on Windows (Git Bash strips inner quotes). `poc.sh` uses base64 + `kubectl apply -f -` to guarantee verbatim JSON.
 
 ---
 
-## ESO/Vault Integration: Confirmed Working ✅
+## ESO/Vault Secrets Handoff: Confirmed Working ✅
 
 ### ESO API Version Changes
 
@@ -156,46 +172,27 @@ secretStoreRefs:
 
 ```
 Crossplane APIKey connection secret (crossplane-system)
-  → PushSecret (Synced: orders-events-f9lvr-push)
-  → Vault (dev mode, http://vault.vault.svc.cluster.local:8200)
-  → ExternalSecret (SecretSynced: payments-consumer-kafka-creds)
-  → K8s Secret (payments-consumer-kafka-creds in team-payments)
+  → PushSecret → Vault (dev mode, http://vault.vault.svc.cluster.local:8200)
+  → ExternalSecret → K8s Secret (payments-consumer-kafka-creds in team-payments)
      keys: api_key_id, api_key_secret
 ```
 
 App team Deployment mounts `payments-consumer-kafka-creds` as a plain Secret. No Crossplane, Vault, or ESO knowledge required by the app team.
 
-### ClusterSecretStore configuration
-
-```yaml
-apiVersion: external-secrets.io/v1
-kind: ClusterSecretStore
-metadata:
-  name: vault-cluster-store
-spec:
-  provider:
-    vault:
-      server: "http://vault.vault.svc.cluster.local:8200"
-      path: "secret"
-      version: "v2"
-      auth:
-        tokenSecretRef:
-          name: vault-token
-          key: token
-          namespace: external-secrets
-```
-
 ---
 
-## GitOps Delivery: Not Yet Validated
+## GitOps Delivery: Confirmed Working ✅
 
-The Argo CD Application (`gitops/argocd-app.yaml`) is written but not yet applied. The `argocd-cm` annotation-based tracking and `ProviderConfigUsage` exclusions are not yet configured.
+**Argo CD Application:** Synced + Healthy. Annotation-based resource tracking and ProviderConfigUsage exclusions confirmed active.
 
-**Next steps:**
-1. Patch `argocd-cm` with annotation tracking + ProviderConfigUsage exclusions
-2. Apply `gitops/argocd-app.yaml`
-3. Delete manually-applied claim and Deployment — let Argo CD resync from git
-4. Validate prune behavior (revert commit → cascade delete)
+- `application.resourceTrackingMethod: annotation` — verified in `argocd-cm`
+- `ProviderConfigUsage` exclusion — no spurious OutOfSync from Crossplane-generated objects
+- `KafkaTopicClaim` applied via Argo CD from `git push` with no manual `kubectl apply`
+- Drift detection scoped to `crossplane/claims/` manifests only — managed resources live in-cluster and are not tracked in git, so Argo CD correctly ignores them
+
+**argocd-cm settings baked into Helm at install time** — no post-install patch or controller restart required. Both exclusion rules (`Endpoints` and `ProviderConfigUsage`) are embedded in the `helm upgrade --install` values heredoc in `poc.sh up`.
+
+**GitOps teardown (revert commit → cascade delete): NOT YET EXERCISED.** This is the last remaining gate. Risk area: claim deletion finalizer must clear through Crossplane before Argo CD considers the resource pruned. Validate before the demo.
 
 ---
 
@@ -214,17 +211,21 @@ The app team claim is a 5-line YAML file. At scale, generating these via git PR 
 - Argo CD auto-syncs the PR once merged
 - The entire flow: form submit → PR review → merge → topic provisioned → zero kubectl
 
-This is out of scope for the POC but is the correct production path. Document this as the "how do app teams actually use this" story for the go/no-go recommendation.
+This is out of scope for the POC but is the correct production path.
 
 ---
 
-## Go/No-Go Assessment (Preliminary)
+## Go/No-Go Assessment
 
-| Area | Assessment | Blocker? |
-|------|-----------|---------|
-| **Confluent Cloud (provider-confluent)** | Core resources (Topic, SA, APIKey, RoleBinding) work. Schema deferred. Stream Governance absent. | No (for basic use case); Yes (for stream governance) |
-| **provider-kubernetes Object wrapping** | Pattern proven for all 6 resource types. Cross-provider patch confirmed. | No |
-| **GitOps delivery (Argo CD)** | Not yet validated (structural artifacts written). | Pending |
-| **ESO/Vault secrets handoff** | Objects structurally correct; not yet reconciling (ESO not installed). | Pending |
-| **RBAC scoping** | Basic tier blocks resource-level roles. CloudClusterAdmin is overly permissive. | Yes (for Standard/Dedicated); No for Basic with broad access |
-| **Crossplane v2 XRD claims** | v2 drops claims; must use v1 (deprecated). Migration path unclear. | Risk (future) |
+| Area | Verdict | Notes |
+|------|---------|-------|
+| **Confluent Cloud (provider-confluent)** | ✅ GO | Topic, SA, APIKey, RoleBinding all work. Stream Governance absent — flag separately. Schema deferred (credential chain complexity). |
+| **Cross-provider patching** | ✅ GO | Confirmed: `KafkaTopic.status.atProvider.partitionsCount` → XR status → `ScaledObject.spec.maxReplicaCount`. Claim is the single source of truth. |
+| **provider-kubernetes Object wrapping** | ✅ GO | All 6 K8s resource types created and managed correctly. No limitations found. |
+| **ESO/Vault secrets handoff** | ✅ GO | Full chain confirmed. App team mounts a plain Secret with no Crossplane or Vault knowledge. |
+| **GitOps delivery (Argo CD)** | ✅ GO | Synced + Healthy. Annotation tracking + ProviderConfigUsage exclusions confirmed. Teardown not yet exercised — validate before demo. |
+| **RBAC scoping** | ⚠️ CONDITION | Basic tier blocks resource-level roles. CloudClusterAdmin is overly permissive. Standard/Dedicated tier required for production. |
+| **Crossplane v2 XRD claims** | ⚠️ RISK | v2 drops claims; must use deprecated v1. Monitor Crossplane v2 roadmap for the claims migration path before production adoption. |
+| **Stream Governance** | ❌ NO-GO | No CRDs in provider-confluent v1.0.0. Requires out-of-band integration. Not suitable for teams that need tags or business metadata on topics. |
+
+**Overall recommendation: GO — with conditions.** The core platform pattern (claim → Crossplane Composition → Confluent Cloud + Kubernetes resources → GitOps delivery) is validated end-to-end. Two conditions before production: (1) upgrade to Standard/Dedicated tier for scoped RBAC, (2) resolve the XRD v1 deprecation path. Stream Governance is a separate conversation — if required, provider-confluent is not sufficient today.
