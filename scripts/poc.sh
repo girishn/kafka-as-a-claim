@@ -100,7 +100,9 @@ cmd_up() {
     echo "==> Creating Confluent Cloud environment: $ENV_NAME"
     ENV_OUTPUT=$(confluent environment create "$ENV_NAME" \
       --governance-package ESSENTIALS \
-      --output json)
+      --output json 2>/dev/null) || \
+    ENV_OUTPUT=$(confluent environment list --output json | \
+      jq -r --arg n "$ENV_NAME" '[.[] | select(.name == $n)] | .[0]')
     ENV_ID=$(echo "$ENV_OUTPUT" | jq -r '.id')
     echo "    environment_id = $ENV_ID"
 
@@ -110,7 +112,10 @@ cmd_up() {
       --cloud aws \
       --region "$AWS_REGION" \
       --type basic \
-      --output json)
+      --output json 2>/dev/null) || \
+    CLUSTER_OUTPUT=$(confluent kafka cluster list \
+      --environment "$ENV_ID" --output json | \
+      jq -r --arg n "$CLUSTER_NAME" '[.[] | select(.name == $n)] | .[0]')
     CLUSTER_ID=$(echo "$CLUSTER_OUTPUT" | jq -r '.id')
     echo "    cluster_id = $CLUSTER_ID"
 
@@ -127,15 +132,17 @@ cmd_up() {
     echo "==> Creating Crossplane service account: $SA_NAME"
     SA_OUTPUT=$(confluent iam service-account create "$SA_NAME" \
       --description "Crossplane provider-confluent POC — do not use manually" \
-      --output json)
+      --output json 2>/dev/null) || \
+    SA_OUTPUT=$(confluent iam service-account list --output json | \
+      jq -r --arg n "$SA_NAME" '[.[] | select(.display_name == $n or .name == $n)] | .[0]')
     SA_ID=$(echo "$SA_OUTPUT" | jq -r '.id')
     echo "    service_account_id = $SA_ID"
 
-    echo "==> Assigning EnvironmentAdmin role to Crossplane SA"
+    echo "==> Assigning EnvironmentAdmin role to Crossplane SA (idempotent)"
     confluent iam rbac role-binding create \
       --principal "User:${SA_ID}" \
       --role EnvironmentAdmin \
-      --environment "$ENV_ID"
+      --environment "$ENV_ID" 2>/dev/null || true
 
     echo "==> Creating Cloud API key for Crossplane SA"
     KEY_OUTPUT=$(confluent api-key create \
@@ -203,16 +210,18 @@ cmd_up() {
     echo "==> Creating producer service account: $PRODUCER_SA_NAME"
     PRODUCER_SA_OUTPUT=$(confluent iam service-account create "$PRODUCER_SA_NAME" \
       --description "Shipments event producer — demo only" \
-      --output json)
+      --output json 2>/dev/null) || \
+    PRODUCER_SA_OUTPUT=$(confluent iam service-account list --output json | \
+      jq -r --arg n "$PRODUCER_SA_NAME" '[.[] | select(.display_name == $n or .name == $n)] | .[0]')
     PRODUCER_SA_ID=$(echo "$PRODUCER_SA_OUTPUT" | jq -r '.id')
     echo "    producer_sa_id = $PRODUCER_SA_ID"
 
-    echo "==> Assigning CloudClusterAdmin to producer SA (Basic tier limitation)"
+    echo "==> Assigning CloudClusterAdmin to producer SA (idempotent)"
     confluent iam rbac role-binding create \
       --principal "User:${PRODUCER_SA_ID}" \
       --role CloudClusterAdmin \
       --environment "$ENV_ID" \
-      --cloud-cluster "$CLUSTER_ID"
+      --cloud-cluster "$CLUSTER_ID" 2>/dev/null || true
 
     echo "==> Creating Kafka API key for producer SA"
     PRODUCER_KEY_OUTPUT=$(confluent api-key create \
