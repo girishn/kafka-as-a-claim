@@ -200,6 +200,7 @@ cmd_up() {
     echo "==> Creating Schema Registry API key for Crossplane SA"
     SR_KEY_OUTPUT=$(confluent api-key create \
       --resource "$SR_ID" \
+      --environment "$ENV_ID" \
       --service-account "$SA_ID" \
       --description "crossplane-poc-sr-key" \
       --output json)
