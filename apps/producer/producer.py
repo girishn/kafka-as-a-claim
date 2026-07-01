@@ -4,6 +4,7 @@ import time
 import random
 import string
 from datetime import datetime, timezone
+import certifi
 from confluent_kafka import Producer
 
 BOOTSTRAP_SERVERS = os.environ['BOOTSTRAP_SERVERS']
@@ -19,6 +20,7 @@ conf = {
     'sasl.mechanism': 'PLAIN',
     'sasl.username': API_KEY,
     'sasl.password': API_SECRET,
+    'ssl.ca.location': certifi.where(),
 }
 
 CITIES = [

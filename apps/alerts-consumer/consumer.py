@@ -1,6 +1,7 @@
 import os
 import json
 from datetime import datetime, timezone
+import certifi
 from confluent_kafka import Consumer, KafkaError
 
 BOOTSTRAP_SERVERS = os.environ['BOOTSTRAP_SERVERS']
@@ -15,6 +16,7 @@ conf = {
     'sasl.mechanism': 'PLAIN',
     'sasl.username': API_KEY,
     'sasl.password': API_SECRET,
+    'ssl.ca.location': certifi.where(),
     'group.id': CONSUMER_GROUP,
     'auto.offset.reset': 'earliest',
     'enable.auto.commit': True,
