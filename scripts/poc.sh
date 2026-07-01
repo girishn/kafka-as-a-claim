@@ -410,13 +410,19 @@ cmd_down() {
     kubectl delete kafkatopiclaims.platform.girishn.cloud orders-events \
       -n team-payments --ignore-not-found --wait --timeout=5m 2>/dev/null || true
 
-    # Belt-and-suspenders: force-delete any stuck Confluent MRs.
+    # Belt-and-suspenders: strip finalizers then delete any stuck Confluent MRs.
+    # Patch-first is required because the KafkaTopic needs APIKey credentials to
+    # call Confluent's REST API on deletion — but the APIKey is deleted first in
+    # the cascade, leaving the KafkaTopic finalizer permanently stuck.
     for CRD in kafkatopics serviceaccounts apikeys rolebindings; do
       FULL="${CRD}.confluent.crossplane.io"
       REMAINING=$(kubectl get "$FULL" --all-namespaces --no-headers 2>/dev/null \
         | grep -c '[a-z]' || true)
       if [ "${REMAINING:-0}" -gt 0 ]; then
-        echo "    forcing deletion of remaining $FULL..."
+        echo "    stripping finalizers and deleting remaining $FULL..."
+        kubectl get "$FULL" --all-namespaces -o name 2>/dev/null \
+          | xargs -I{} kubectl patch {} --type=merge \
+              -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
         kubectl delete "$FULL" --all --all-namespaces \
           --ignore-not-found 2>/dev/null || true
       fi
