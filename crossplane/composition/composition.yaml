@@ -11,6 +11,9 @@
 #      CloudClusterAdmin is the only cluster-scoped role available. Upgrading to
 #      Standard/Dedicated tier enables scoped topic-level RBAC — see FINDINGS.md.
 #   4. KafkaTopic         — the actual topic; credentials from APIKey connection secret
+#   11. Schema            — Avro schema registered against Schema Registry
+#       Requires a separate SR API key in confluent-sr-credentials (crossplane-system).
+#       schemaRegistryCluster.id and restEndpoint are patched by poc.sh up via sed.
 #
 # Kubernetes-side resources (via provider-kubernetes Object wrappers):
 #   5. KEDA ScaledObject  — scales consumerName Deployment on consumer lag
@@ -21,19 +24,27 @@
 #   7. NetworkPolicy      — placeholder (PSC requires Dedicated tier); proves Object wrapping
 #   8. PodDisruptionBudget — ensures consumerName Deployment stays available during rollouts
 #   9. ESO PushSecret     — pushes APIKey connection secret from crossplane-system into Vault
-#  10. ESO ExternalSecret — pulls from Vault into team-payments as a plain K8s Secret
+#  10. ESO ExternalSecret — pulls from Vault into the claim namespace as a plain K8s Secret
+#
+# Namespace isolation:
+#   All 5 Object manifests that target the team namespace (ScaledObject, TriggerAuth,
+#   NetworkPolicy, PDB, ExternalSecret) patch their namespace from spec.claimRef.namespace.
+#   This ensures shipment-tracking (team-logistics) and delivery-alerts (team-operations)
+#   each get their resources in the correct namespace.
 #
 # Cross-provider patch path (step 5):
 #   KafkaTopic.status.atProvider.partitionsCount
 #   → (ToCompositeFieldPath) → XR.status.provisioned.partitionsCount
 #   → (FromCompositeFieldPath, Optional) → ScaledObject.spec.maxReplicaCount
 #
-# Confluent Cloud constants embedded here (confirm with `confluent kafka cluster describe`):
-#   ORG_ID:       35eebd08-f76f-428a-83c9-e8a2dc4c9bae
-#   ENV_ID:       env-66xmmj
-#   CLUSTER_ID:   lkc-81165pr
-#   REST_ENDPOINT: https://pkc-oxqxx9.us-east-1.aws.confluent.cloud:443
-#   BOOTSTRAP:    pkc-oxqxx9.us-east-1.aws.confluent.cloud:9092
+# Confluent Cloud constants embedded here — auto-patched by poc.sh up via sed:
+#   ORG_ID:           35eebd08-f76f-428a-83c9-e8a2dc4c9bae
+#   ENV_ID:           env-66xmmj
+#   CLUSTER_ID:       lkc-81165pr
+#   REST_ENDPOINT:    https://pkc-oxqxx9.us-east-1.aws.confluent.cloud:443
+#   BOOTSTRAP:        pkc-oxqxx9.us-east-1.aws.confluent.cloud:9092
+#   SR_CLUSTER_ID:    lsrc-placeholder
+#   SR_REST_ENDPOINT: https://psrc-placeholder.confluent.cloud
 apiVersion: apiextensions.crossplane.io/v1
 kind: Composition
 metadata:
@@ -197,6 +208,10 @@ spec:
           #           from Confluent (Optional; takes effect after Topic reconciles)
           # Pass B runs after Pass A in the same function invocation, so when the
           # XR status field is populated it wins. This is what the POC validates.
+          #
+          # KEDA auth for Confluent Cloud SASL_SSL:
+          #   sasl: plaintext  — SASL/PLAIN mechanism (NOT the protocol string "SASL_SSL")
+          #   tls: enable      — TLS is mandatory on Confluent Cloud port 9092
           - name: keda-scaled-object
             base:
               apiVersion: kubernetes.crossplane.io/v1alpha2
@@ -208,7 +223,7 @@ spec:
                     kind: ScaledObject
                     metadata:
                       name: ""
-                      namespace: team-payments
+                      namespace: ""
                     spec:
                       scaleTargetRef:
                         name: ""
@@ -224,11 +239,14 @@ spec:
                             topic: ""
                             lagThreshold: "50"
                             activationLagThreshold: "1"
-                            sasl: sasl_ssl
-                            tls: none
+                            sasl: plaintext
+                            tls: enable
                 providerConfigRef:
                   name: default
             patches:
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.claimRef.namespace
+                toFieldPath: spec.forProvider.manifest.metadata.namespace
               - type: FromCompositeFieldPath
                 fromFieldPath: spec.consumerName
                 toFieldPath: spec.forProvider.manifest.metadata.name
@@ -274,7 +292,7 @@ spec:
                     kind: TriggerAuthentication
                     metadata:
                       name: ""
-                      namespace: team-payments
+                      namespace: ""
                     spec:
                       secretTargetRef:
                         - parameter: username
@@ -286,6 +304,9 @@ spec:
                 providerConfigRef:
                   name: default
             patches:
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.claimRef.namespace
+                toFieldPath: spec.forProvider.manifest.metadata.namespace
               - type: FromCompositeFieldPath
                 fromFieldPath: spec.consumerName
                 toFieldPath: spec.forProvider.manifest.metadata.name
@@ -327,7 +348,7 @@ spec:
                     kind: NetworkPolicy
                     metadata:
                       name: ""
-                      namespace: team-payments
+                      namespace: ""
                       annotations:
                         platform.girishn.cloud/placeholder: "true"
                     spec:
@@ -343,6 +364,9 @@ spec:
                 providerConfigRef:
                   name: default
             patches:
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.claimRef.namespace
+                toFieldPath: spec.forProvider.manifest.metadata.namespace
               - type: FromCompositeFieldPath
                 fromFieldPath: spec.consumerName
                 toFieldPath: spec.forProvider.manifest.metadata.name
@@ -367,7 +391,7 @@ spec:
                     kind: PodDisruptionBudget
                     metadata:
                       name: ""
-                      namespace: team-payments
+                      namespace: ""
                     spec:
                       minAvailable: 1
                       selector:
@@ -376,6 +400,9 @@ spec:
                 providerConfigRef:
                   name: default
             patches:
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.claimRef.namespace
+                toFieldPath: spec.forProvider.manifest.metadata.namespace
               - type: FromCompositeFieldPath
                 fromFieldPath: spec.consumerName
                 toFieldPath: spec.forProvider.manifest.metadata.name
@@ -392,6 +419,7 @@ spec:
           # Pushes the Kafka API key from the connection secret in crossplane-system
           # into Vault at path kafka/<xr-name>. The ClusterSecretStore (vault-cluster-store)
           # must be configured separately before this will reconcile successfully.
+          # PushSecret stays in crossplane-system (where the source secret lives).
           - name: eso-push-secret
             base:
               apiVersion: kubernetes.crossplane.io/v1alpha2
@@ -462,7 +490,7 @@ spec:
                       fmt: "kafka/%s"
 
           # ── 10. ESO ExternalSecret ────────────────────────────────────────────
-          # Pulls from Vault kafka/<xr-name> into a plain Secret in team-payments.
+          # Pulls from Vault kafka/<xr-name> into a plain Secret in the claim namespace.
           # The consumer Deployment mounts this Secret — no Crossplane or Vault
           # knowledge required by the app team.
           - name: eso-external-secret
@@ -476,7 +504,7 @@ spec:
                     kind: ExternalSecret
                     metadata:
                       name: ""
-                      namespace: team-payments
+                      namespace: ""
                     spec:
                       refreshInterval: 1h
                       secretStoreRef:
@@ -497,6 +525,9 @@ spec:
                 providerConfigRef:
                   name: default
             patches:
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.claimRef.namespace
+                toFieldPath: spec.forProvider.manifest.metadata.namespace
               - type: FromCompositeFieldPath
                 fromFieldPath: spec.consumerName
                 toFieldPath: spec.forProvider.manifest.metadata.name
@@ -529,3 +560,41 @@ spec:
                     string:
                       type: Format
                       fmt: "kafka/%s"
+
+          # ── 11. Schema Registry — Avro Schema ─────────────────────────────────
+          # Registers the Avro schema supplied in spec.schemaBody under the subject
+          # name from spec.valueSchema. Requires:
+          #   - confluent-sr-credentials Secret in crossplane-system (SR API key)
+          #   - schemaRegistryCluster.id and restEndpoint patched by poc.sh via sed
+          # The Schema resource uses the same default ProviderConfig (cloud credentials)
+          # for management plane calls; SR data plane auth is in the credentials block.
+          - name: schema-registry
+            base:
+              apiVersion: confluent.crossplane.io/v1alpha1
+              kind: Schema
+              spec:
+                forProvider:
+                  subjectName: ""
+                  format: "AVRO"
+                  schema: ""
+                  schemaRegistryCluster:
+                    - id: "lsrc-placeholder"
+                  restEndpoint: "https://psrc-placeholder.confluent.cloud"
+                  credentials:
+                    - keySecretRef:
+                        namespace: crossplane-system
+                        name: confluent-sr-credentials
+                        key: sr_api_key
+                      secretSecretRef:
+                        namespace: crossplane-system
+                        name: confluent-sr-credentials
+                        key: sr_api_secret
+                providerConfigRef:
+                  name: default
+            patches:
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.valueSchema
+                toFieldPath: spec.forProvider.subjectName
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.schemaBody
+                toFieldPath: spec.forProvider.schema

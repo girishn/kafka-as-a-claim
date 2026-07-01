@@ -23,7 +23,7 @@ spec:
               properties:
                 topicName:
                   type: string
-                  description: "Kafka topic name (e.g., orders.events)"
+                  description: "Kafka topic name (e.g., shipments.events)"
                 partitions:
                   type: integer
                   default: 6
@@ -33,11 +33,16 @@ spec:
                   description: "Consumer identifier — used for the Confluent SA displayName, KEDA ScaledObject, Deployment selector, NetworkPolicy, and PodDisruptionBudget"
                 valueSchema:
                   type: string
-                  description: "Avro subject name. Schema registration is deferred to a second pass — see FINDINGS.md for Schema Registry credential complexity."
+                  description: "Schema Registry subject name (e.g., shipments.events-value). Required when schemaBody is provided."
+                schemaBody:
+                  type: string
+                  description: "Avro schema JSON as a single-line string. Registered under valueSchema subject in Schema Registry. Required when valueSchema is provided."
               required:
                 - topicName
                 - partitions
                 - consumerName
+                - valueSchema
+                - schemaBody
             status:
               type: object
               properties:

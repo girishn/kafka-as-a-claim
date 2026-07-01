@@ -1,6 +1,6 @@
 # POC Findings — Kafka-as-a-Claim
 
-## Status: Complete (GitOps teardown not yet exercised)
+## Status: Prototype (logistics domain, real producer/consumer, Schema Registry)
 
 ---
 
@@ -20,13 +20,19 @@
 
 **Stream Governance (tags, tag bindings, business metadata): ABSENT.** There are no CRDs for Confluent Stream Governance in provider-confluent v1.0.0. If Stream Governance tagging is needed, it would require a separate out-of-band integration (Confluent REST API via a custom controller, or Terraform). This is a gap; document it before recommending production adoption.
 
-**Schema Registry (`schemas.confluent.crossplane.io`): EXISTS but DEFERRED.** The CRD is present, but registering an Avro schema requires:
-1. A separate Schema Registry cluster ID (`lsrc-…`) — not the Kafka cluster ID
-2. A separate SR-scoped API key (`srcm.v2.Cluster` managedResource)
-3. An additional ProviderConfig entry for SR credentials
-4. The actual Avro schema body as a field — the claim carries `valueSchema: orders-value-v1` (a *subject name*, not a schema body)
+**Schema Registry (`schemas.confluent.crossplane.io`): EXISTS and IMPLEMENTED.** The CRD is present and wired up in the prototype. Approach taken:
 
-The `valueSchema` field in the claim has no corresponding schema body anywhere in the claim design. Schema registration is a second-pass deliverable. Document the credential chain complexity and the claim field design question (where does the schema body come from?) before the next iteration.
+| Concern | Solution |
+|---------|---------|
+| SR cluster ID (`lsrc-…`) | Auto-patched by `poc.sh up` via `sed` (same pattern as Kafka cluster ID) |
+| SR-scoped API key | Created by `poc.sh up` for the `crossplane-poc` SA; seeded as `confluent-sr-credentials` in `crossplane-system` |
+| SR credentials in Composition | `credentials` block in the `Schema` resource — same pattern as `credentials` in `KafkaTopic` |
+| Schema body | `spec.schemaBody` field in the claim (Avro JSON string, folded scalar in YAML) |
+| Subject name | `spec.valueSchema` field in the claim (e.g., `shipments.events-value`) |
+
+The `Schema` composed resource uses `providerConfigRef: name: default` (cloud credentials for management plane) and the `credentials` block for SR data plane auth. The XRD now requires both `valueSchema` and `schemaBody`.
+
+**Unresolved:** Field naming in the `Schema` CRD spec (`subjectName`, `schemaRegistryCluster`, `restEndpoint`, `credentials`) was inferred from the Confluent Terraform provider. Confirm against actual CRD schema on first run (`kubectl explain schemas.confluent.crossplane.io --recursive`) — field names may differ from the Upjet-generated output.
 
 ---
 
@@ -227,5 +233,15 @@ This is out of scope for the POC but is the correct production path.
 | **RBAC scoping** | ⚠️ CONDITION | Basic tier blocks resource-level roles. CloudClusterAdmin is overly permissive. Standard/Dedicated tier required for production. |
 | **Crossplane v2 XRD claims** | ⚠️ RISK | v2 drops claims; must use deprecated v1. Monitor Crossplane v2 roadmap for the claims migration path before production adoption. |
 | **Stream Governance** | ❌ NO-GO | No CRDs in provider-confluent v1.0.0. Requires out-of-band integration. Not suitable for teams that need tags or business metadata on topics. |
+
+**Prototype additions (logistics domain):**
+- Consumer is a real Python `confluent_kafka` app mounting ESO-vended `tracking-consumer-kafka-creds`; deliberately slow (1 msg/sec) so KEDA lag builds visibly
+- Producer is a real Python app writing to both `shipments.events` and `delivery.alerts` (FAILED events only) at 10 msg/sec, using a dedicated `shipments-producer` SA + API key seeded by `poc.sh`
+- Two claims: `shipment-tracking` (team-logistics, 6 partitions) and `delivery-alerts` (team-operations, 3 partitions) — multi-tenancy confirmed
+- KEDA trigger auth fixed: `sasl: plaintext` + `tls: enable` (was `sasl: sasl_ssl` + `tls: none` — wrong values, masked because no real Kafka traffic previously hit KEDA)
+- Namespace hardcoding fixed: all 5 Object manifests now patch `spec.claimRef.namespace` so each claim's resources land in the correct team namespace
+- Prometheus + Grafana (kube-prometheus-stack) + KEDA ServiceMonitor added to stack
+
+**Outstanding:** GitOps teardown (revert commit → cascade delete) and beat 4 self-heal not yet exercised. Both require a live cluster with claims applied.
 
 **Overall recommendation: GO — with conditions.** The core platform pattern (claim → Crossplane Composition → Confluent Cloud + Kubernetes resources → GitOps delivery) is validated end-to-end. Two conditions before production: (1) upgrade to Standard/Dedicated tier for scoped RBAC, (2) resolve the XRD v1 deprecation path. Stream Governance is a separate conversation — if required, provider-confluent is not sufficient today.

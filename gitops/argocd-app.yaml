@@ -11,7 +11,7 @@ spec:
     path: crossplane/claims
   destination:
     server: https://kubernetes.default.svc
-    namespace: team-payments
+    namespace: team-logistics
   syncPolicy:
     automated:
       prune: true

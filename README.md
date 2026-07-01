@@ -16,27 +16,31 @@ Neither scales. Neither is self-service.
 
 ## The Solution
 
-An app team submits a 5-line YAML claim via git PR:
+An app team submits a short YAML claim via git PR:
 
 ```yaml
 apiVersion: platform.girishn.cloud/v1alpha1
 kind: KafkaTopicClaim
 metadata:
-  name: orders-events
-  namespace: team-payments
+  name: shipment-tracking
+  namespace: team-logistics
 spec:
-  topicName: orders.events
+  topicName: shipments.events
   partitions: 6
-  consumerName: payments-consumer
+  consumerName: tracking-consumer
+  valueSchema: shipments.events-value
+  schemaBody: >-
+    {"type":"record","name":"ShipmentEvent","namespace":"com.logistics.events","fields":[{"name":"shipment_id","type":"string"},{"name":"status","type":"string"},{"name":"origin","type":"string"},{"name":"destination","type":"string"},{"name":"carrier","type":"string"},{"name":"timestamp","type":"long"}]}
 ```
 
 A Kubernetes control loop — driven by Crossplane + Argo CD — turns that claim into:
 
 | What | Where |
 |------|-------|
-| Kafka topic (`orders.events`, 6 partitions) | Confluent Cloud |
+| Kafka topic (`shipments.events`, 6 partitions) | Confluent Cloud |
 | Consumer service account + scoped RBAC | Confluent Cloud |
 | Kafka API key for the consumer | Confluent Cloud |
+| Avro schema registered in Schema Registry | Confluent Cloud |
 | KEDA `ScaledObject` (max replicas = partition count) | Kubernetes |
 | `NetworkPolicy` for egress to Confluent | Kubernetes |
 | `PodDisruptionBudget` for the consumer | Kubernetes |
@@ -90,18 +94,18 @@ A Kubernetes control loop — driven by Crossplane + Argo CD — turns that clai
 ┌─────────────────────────────────────────────────────────────┐
 │  ESO + Vault                                                │
 │                                                             │
-│  crossplane-system secret → Vault KV → team-payments secret │
+│  crossplane-system secret → Vault KV → team-logistics secret │
 └─────────────────────────────────────────────────────────────┘
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  App Deployment (team-payments namespace)                    │
+│  App Deployment (team-logistics namespace)                   │
 │                                                             │
 │  env:                                                       │
 │    - name: KAFKA_API_KEY                                    │
 │      valueFrom:                                             │
 │        secretKeyRef:                                        │
-│          name: payments-consumer-kafka-creds                │
+│          name: tracking-consumer-kafka-creds                │
 │          key: api_key_id                                    │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -144,13 +148,15 @@ bash scripts/poc.sh up
 ```
 
 The script provisions in order:
-1. Confluent Cloud environment, Basic cluster, service account, API key
+0. Docker images built + loaded into kind (producer, tracking-consumer, alerts-consumer)
+1. Confluent Cloud: environment, Basic cluster, Crossplane SA, Schema Registry API key, producer SA + API key
 2. Crossplane v2 (pinned to latest stable v2.x)
 3. provider-confluent + provider-kubernetes + function-patch-and-transform
 4. KEDA
 5. Vault (dev mode) + External Secrets Operator
-6. XRD + Composition
-7. Argo CD (annotation tracking + ProviderConfigUsage exclusions baked in)
+6. Prometheus + Grafana (kube-prometheus-stack) + KEDA ServiceMonitor
+7. XRD + Composition
+8. Argo CD (annotation tracking + ProviderConfigUsage exclusions baked in)
 
 Re-running `up` is safe — Helm uses `upgrade --install` and Confluent Cloud is skipped if already provisioned.
 
@@ -192,14 +198,29 @@ kubectl get managed -o wide
 # Observed partition count on the XR (sourced from Confluent Cloud)
 kubectl get xkafkatopic -o jsonpath='{.items[0].status.provisioned.partitionsCount}'
 
-# ScaledObject maxReplicaCount (must match the above)
-kubectl get scaledobject -n team-payments orders-events \
+# ScaledObject maxReplicaCount (must match the above — live from Confluent, not hardcoded)
+kubectl get scaledobject -n team-logistics tracking-consumer \
   -o jsonpath='{.spec.maxReplicaCount}'
 ```
 
 **Secrets delivery — Kafka creds in app namespace:**
 ```bash
-kubectl get secret payments-consumer-kafka-creds -n team-payments
+kubectl get secret tracking-consumer-kafka-creds -n team-logistics
+```
+
+**Consumer lag (KEDA scaling in action):**
+```bash
+# Watch KEDA scale the tracking-consumer up as producer outpaces it
+kubectl get hpa -n team-logistics -w
+# Or watch replicas directly
+kubectl get deployment tracking-consumer -n team-logistics -w
+```
+
+**Grafana — consumer lag dashboard:**
+```bash
+kubectl port-forward svc/prometheus-grafana -n monitoring 3000:80
+# open http://localhost:3000  (admin/admin)
+# Query: keda_scaler_metrics_value{scaler="kafkaScaler"}
 ```
 
 > **Note:** The KafkaTopic will fail transiently with `credentials.0.key is empty`
@@ -271,7 +292,7 @@ Five beats. Each beat has a before.
 Open the repo — count the files an app team had to understand and touch before this platform existed: Terraform modules, Confluent provider config, RBAC rules, secret management, reviewer back-and-forth.
 
 ### 2. Show the claim
-Open [`crossplane/claims/orders-events.yaml`](crossplane/claims/orders-events.yaml). Five lines of YAML. Everything else — topic creation, RBAC, API key, KEDA scaling, secret delivery — is below the abstraction line. The app team never sees it.
+Open [`crossplane/claims/shipment-tracking.yaml`](crossplane/claims/shipment-tracking.yaml). A handful of fields: topic name, partitions, consumer name, Avro schema. Everything else — Confluent SA, RBAC, API key, Schema Registry registration, KEDA scaling, Vault push, secret delivery — is below the abstraction line. The app team never sees it.
 
 ### 3. Git push — show it land *(this is the beat that makes the room go quiet)*
 ```bash
@@ -285,6 +306,8 @@ In the Confluent Cloud console, manually edit the RoleBinding or delete the topi
 ### 5. Show the observability proof
 Pull up the KEDA ScaledObject:
 ```bash
-kubectl get scaledobject payments-consumer -n team-payments -o jsonpath='{.spec.maxReplicaCount}'
+kubectl get scaledobject tracking-consumer -n team-logistics -o jsonpath='{.spec.maxReplicaCount}'
 ```
 The value came from the live partition count on Confluent Cloud — not a hardcoded number. The claim is the single source of truth: change `spec.partitions`, and both the Confluent topic and the KEDA ceiling update together.
+
+Then open Grafana at `http://localhost:3000`. The `keda_scaler_metrics_value` metric shows consumer lag in real time. The producer writes 10 events/sec; the tracking consumer processes 1/sec — lag builds, KEDA scales replicas up to the partition ceiling.

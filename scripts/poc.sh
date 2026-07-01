@@ -8,6 +8,7 @@
 # Prerequisites (must be done before running this script):
 #   confluent login                              (Confluent Cloud auth)
 #   kind create cluster --name kafka-claim-poc   (or any reachable cluster)
+#   docker                                       (for building consumer/producer images)
 #
 # Running 'up' when a state file already exists skips Confluent Cloud and
 # re-applies the K8s stack (all Helm installs are idempotent via upgrade --install).
@@ -23,6 +24,7 @@ STATE_FILE="${SCRIPT_DIR}/.poc-state"
 ENV_NAME="${CONFLUENT_ENV_NAME:-kafka-claim-poc}"
 CLUSTER_NAME="${CONFLUENT_CLUSTER_NAME:-kafka-claim-poc-cluster}"
 SA_NAME="${CONFLUENT_SA_NAME:-crossplane-poc}"
+PRODUCER_SA_NAME="${PRODUCER_SA_NAME:-shipments-producer}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 K8S_NAMESPACE="${K8S_NAMESPACE:-crossplane-system}"
 
@@ -47,6 +49,8 @@ check_cmd confluent
 check_cmd kubectl
 check_cmd helm
 check_cmd jq
+check_cmd docker
+check_cmd kind
 
 if ! confluent environment list --output json &>/dev/null; then
   echo "ERROR: Not logged in to Confluent Cloud. Run: confluent login --save"
@@ -63,10 +67,28 @@ cmd_up() {
     exit 1
   fi
 
+  # ── 0. Build Docker images and load into kind ─────────────────────────────
+  echo ""
+  echo "════════════════════════════════════════════════"
+  echo " 0/8  Docker images"
+  echo "════════════════════════════════════════════════"
+
+  echo "==> Building kafka-producer..."
+  docker build -t kafka-producer:latest "${REPO_DIR}/apps/producer/"
+  kind load docker-image kafka-producer:latest --name kafka-claim-poc
+
+  echo "==> Building kafka-tracking-consumer..."
+  docker build -t kafka-tracking-consumer:latest "${REPO_DIR}/apps/tracking-consumer/"
+  kind load docker-image kafka-tracking-consumer:latest --name kafka-claim-poc
+
+  echo "==> Building kafka-alerts-consumer..."
+  docker build -t kafka-alerts-consumer:latest "${REPO_DIR}/apps/alerts-consumer/"
+  kind load docker-image kafka-alerts-consumer:latest --name kafka-claim-poc
+
   # ── 1. Confluent Cloud ────────────────────────────────────────────────────
   echo ""
   echo "════════════════════════════════════════════════"
-  echo " 1/7  Confluent Cloud"
+  echo " 1/8  Confluent Cloud"
   echo "════════════════════════════════════════════════"
 
   if [[ -f "$STATE_FILE" ]]; then
@@ -102,20 +124,20 @@ cmd_up() {
       sleep 15
     done
 
-    echo "==> Creating service account: $SA_NAME"
+    echo "==> Creating Crossplane service account: $SA_NAME"
     SA_OUTPUT=$(confluent iam service-account create "$SA_NAME" \
       --description "Crossplane provider-confluent POC — do not use manually" \
       --output json)
     SA_ID=$(echo "$SA_OUTPUT" | jq -r '.id')
     echo "    service_account_id = $SA_ID"
 
-    echo "==> Assigning EnvironmentAdmin role to service account"
+    echo "==> Assigning EnvironmentAdmin role to Crossplane SA"
     confluent iam rbac role-binding create \
       --principal "User:${SA_ID}" \
       --role EnvironmentAdmin \
       --environment "$ENV_ID"
 
-    echo "==> Creating Cloud API key for service account"
+    echo "==> Creating Cloud API key for Crossplane SA"
     KEY_OUTPUT=$(confluent api-key create \
       --resource cloud \
       --service-account "$SA_ID" \
@@ -125,17 +147,74 @@ cmd_up() {
     API_SECRET=$(echo "$KEY_OUTPUT" | jq -r '.api_secret // .secret')
     API_KEY_ID="$API_KEY"
 
+    echo "==> Getting Schema Registry cluster details..."
+    # ESSENTIALS governance package includes Schema Registry at the environment level.
+    SR_OUTPUT=$(confluent schema-registry cluster describe \
+      --environment "$ENV_ID" --output json)
+    SR_ID=$(echo "$SR_OUTPUT" | jq -r '.cluster_id // .id // empty')
+    SR_REST_ENDPOINT=$(echo "$SR_OUTPUT" | jq -r '.endpoint_url // .rest_endpoint // empty')
+    if [[ -z "$SR_ID" ]]; then
+      echo "    WARN: Could not get SR cluster ID — Schema Registry may take a moment to activate."
+      echo "    Retrying in 30 seconds..."
+      sleep 30
+      SR_OUTPUT=$(confluent schema-registry cluster describe \
+        --environment "$ENV_ID" --output json)
+      SR_ID=$(echo "$SR_OUTPUT" | jq -r '.cluster_id // .id')
+      SR_REST_ENDPOINT=$(echo "$SR_OUTPUT" | jq -r '.endpoint_url // .rest_endpoint')
+    fi
+    echo "    sr_cluster_id    = $SR_ID"
+    echo "    sr_rest_endpoint = $SR_REST_ENDPOINT"
+
+    echo "==> Creating Schema Registry API key for Crossplane SA"
+    SR_KEY_OUTPUT=$(confluent api-key create \
+      --resource "$SR_ID" \
+      --service-account "$SA_ID" \
+      --description "crossplane-poc-sr-key" \
+      --output json)
+    SR_API_KEY=$(echo "$SR_KEY_OUTPUT" | jq -r '.api_key // .key')
+    SR_API_SECRET=$(echo "$SR_KEY_OUTPUT" | jq -r '.api_secret // .secret')
+    SR_API_KEY_ID="$SR_API_KEY"
+
+    echo "==> Creating producer service account: $PRODUCER_SA_NAME"
+    PRODUCER_SA_OUTPUT=$(confluent iam service-account create "$PRODUCER_SA_NAME" \
+      --description "Shipments event producer — demo only" \
+      --output json)
+    PRODUCER_SA_ID=$(echo "$PRODUCER_SA_OUTPUT" | jq -r '.id')
+    echo "    producer_sa_id = $PRODUCER_SA_ID"
+
+    echo "==> Assigning CloudClusterAdmin to producer SA (Basic tier limitation)"
+    confluent iam rbac role-binding create \
+      --principal "User:${PRODUCER_SA_ID}" \
+      --role CloudClusterAdmin \
+      --environment "$ENV_ID" \
+      --cloud-cluster "$CLUSTER_ID"
+
+    echo "==> Creating Kafka API key for producer SA"
+    PRODUCER_KEY_OUTPUT=$(confluent api-key create \
+      --resource "$CLUSTER_ID" \
+      --service-account "$PRODUCER_SA_ID" \
+      --environment "$ENV_ID" \
+      --description "shipments-producer-key" \
+      --output json)
+    PRODUCER_API_KEY=$(echo "$PRODUCER_KEY_OUTPUT" | jq -r '.api_key // .key')
+    PRODUCER_API_SECRET=$(echo "$PRODUCER_KEY_OUTPUT" | jq -r '.api_secret // .secret')
+    PRODUCER_API_KEY_ID="$PRODUCER_API_KEY"
+
     echo "==> Saving state to $STATE_FILE"
     cat > "$STATE_FILE" <<STATE
 ENV_ID=${ENV_ID}
 CLUSTER_ID=${CLUSTER_ID}
 SA_ID=${SA_ID}
 API_KEY_ID=${API_KEY_ID}
+SR_ID=${SR_ID}
+SR_REST_ENDPOINT=${SR_REST_ENDPOINT}
+SR_API_KEY_ID=${SR_API_KEY_ID}
+PRODUCER_SA_ID=${PRODUCER_SA_ID}
+PRODUCER_API_KEY_ID=${PRODUCER_API_KEY_ID}
 STATE
 
     echo "==> Seeding Confluent credentials secret (namespace: $K8S_NAMESPACE)"
     # Use base64 + kubectl apply — --from-literal strips inner quotes in Git Bash on Windows.
-    # tr -d '\n' removes line-wrapping added by base64 on some platforms.
     CRED_B64=$(printf '{"cloud_api_key":"%s","cloud_api_secret":"%s"}' \
       "${API_KEY}" "${API_SECRET}" | base64 | tr -d '\n')
     kubectl create namespace "$K8S_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
@@ -150,6 +229,39 @@ data:
   credentials: ${CRED_B64}
 YAML
 
+    echo "==> Seeding Schema Registry credentials secret (namespace: $K8S_NAMESPACE)"
+    SR_KEY_B64=$(printf '%s' "${SR_API_KEY}" | base64 | tr -d '\n')
+    SR_SECRET_B64=$(printf '%s' "${SR_API_SECRET}" | base64 | tr -d '\n')
+    kubectl apply -f - <<YAML
+apiVersion: v1
+kind: Secret
+metadata:
+  name: confluent-sr-credentials
+  namespace: ${K8S_NAMESPACE}
+type: Opaque
+data:
+  sr_api_key: ${SR_KEY_B64}
+  sr_api_secret: ${SR_SECRET_B64}
+YAML
+
+    echo "==> Creating team namespaces and seeding producer + kafka-connection..."
+    kubectl create namespace team-logistics --dry-run=client -o yaml | kubectl apply -f -
+    kubectl create namespace team-operations --dry-run=client -o yaml | kubectl apply -f -
+
+    PROD_KEY_B64=$(printf '%s' "${PRODUCER_API_KEY}" | base64 | tr -d '\n')
+    PROD_SECRET_B64=$(printf '%s' "${PRODUCER_API_SECRET}" | base64 | tr -d '\n')
+    kubectl apply -f - <<YAML
+apiVersion: v1
+kind: Secret
+metadata:
+  name: producer-kafka-creds
+  namespace: team-logistics
+type: Opaque
+data:
+  api_key_id: ${PROD_KEY_B64}
+  api_key_secret: ${PROD_SECRET_B64}
+YAML
+
   fi
 
   # ── Patch Composition with current Confluent Cloud IDs ───────────────────
@@ -162,21 +274,59 @@ YAML
   REST_ENDPOINT=$(echo "$CLUSTER_INFO" | jq -r '.rest_endpoint')
   BOOTSTRAP=$(echo "$CLUSTER_INFO" | jq -r '.endpoint' | sed 's|SASL_SSL://||')
 
+  # Re-read SR info from state if we loaded from state file
+  if [[ -z "${SR_REST_ENDPOINT:-}" ]]; then
+    SR_OUTPUT=$(confluent schema-registry cluster describe \
+      --environment "$ENV_ID" --output json)
+    SR_ID=$(echo "$SR_OUTPUT" | jq -r '.cluster_id // .id')
+    SR_REST_ENDPOINT=$(echo "$SR_OUTPUT" | jq -r '.endpoint_url // .rest_endpoint')
+  fi
+
   COMPOSITION_FILE="${REPO_DIR}/crossplane/composition/composition.yaml"
   sed -i "s|env-[a-z0-9]*|${ENV_ID}|g"                                        "$COMPOSITION_FILE"
   sed -i "s|lkc-[a-z0-9]*|${CLUSTER_ID}|g"                                    "$COMPOSITION_FILE"
   sed -i 's|https://pkc-[^"]*\.confluent\.cloud:443|'"${REST_ENDPOINT}"'|g'   "$COMPOSITION_FILE"
   sed -i 's|pkc-[^"]*\.confluent\.cloud:9092|'"${BOOTSTRAP}"'|g'              "$COMPOSITION_FILE"
+  sed -i "s|lsrc-[a-zA-Z0-9_-]*|${SR_ID}|g"                                  "$COMPOSITION_FILE"
+  sed -i 's|https://psrc-[^"]*\.confluent\.cloud|'"${SR_REST_ENDPOINT}"'|g'   "$COMPOSITION_FILE"
 
-  echo "    ENV_ID        = $ENV_ID"
-  echo "    CLUSTER_ID    = $CLUSTER_ID"
-  echo "    REST_ENDPOINT = $REST_ENDPOINT"
-  echo "    BOOTSTRAP     = $BOOTSTRAP"
+  echo "    ENV_ID           = $ENV_ID"
+  echo "    CLUSTER_ID       = $CLUSTER_ID"
+  echo "    REST_ENDPOINT    = $REST_ENDPOINT"
+  echo "    BOOTSTRAP        = $BOOTSTRAP"
+  echo "    SR_ID            = $SR_ID"
+  echo "    SR_REST_ENDPOINT = $SR_REST_ENDPOINT"
+
+  # ── kafka-connection ConfigMaps ───────────────────────────────────────────
+  # These ConfigMaps are created imperatively (not in git) so the consumer/producer
+  # Deployments don't have to hardcode the bootstrap server.
+  echo ""
+  echo "==> Creating kafka-connection ConfigMaps in team namespaces..."
+  kubectl create namespace team-logistics --dry-run=client -o yaml | kubectl apply -f -
+  kubectl create namespace team-operations --dry-run=client -o yaml | kubectl apply -f -
+
+  kubectl apply -f - <<YAML
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-connection
+  namespace: team-logistics
+data:
+  BOOTSTRAP_SERVERS: "${BOOTSTRAP}"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-connection
+  namespace: team-operations
+data:
+  BOOTSTRAP_SERVERS: "${BOOTSTRAP}"
+YAML
 
   # ── 2. Crossplane + Providers ─────────────────────────────────────────────
   echo ""
   echo "════════════════════════════════════════════════"
-  echo " 2/7  Crossplane + Providers"
+  echo " 2/8  Crossplane + Providers"
   echo "════════════════════════════════════════════════"
 
   helm repo add crossplane-stable https://charts.crossplane.io/stable 2>/dev/null || true
@@ -216,7 +366,7 @@ YAML
   # ── 3. KEDA ───────────────────────────────────────────────────────────────
   echo ""
   echo "════════════════════════════════════════════════"
-  echo " 3/7  KEDA"
+  echo " 3/8  KEDA"
   echo "════════════════════════════════════════════════"
 
   echo "==> Installing KEDA in namespace keda..."
@@ -227,7 +377,7 @@ YAML
   # ── 4. Vault (dev mode) ───────────────────────────────────────────────────
   echo ""
   echo "════════════════════════════════════════════════"
-  echo " 4/7  Vault (dev mode)"
+  echo " 4/8  Vault (dev mode)"
   echo "════════════════════════════════════════════════"
 
   echo "==> Installing Vault in namespace vault..."
@@ -239,7 +389,7 @@ YAML
   # ── 5. External Secrets Operator ──────────────────────────────────────────
   echo ""
   echo "════════════════════════════════════════════════"
-  echo " 5/7  External Secrets Operator"
+  echo " 5/8  External Secrets Operator"
   echo "════════════════════════════════════════════════"
 
   echo "==> Installing ESO in namespace external-secrets..."
@@ -279,10 +429,50 @@ spec:
           namespace: external-secrets
 YAML
 
-  # ── 6. XRD + Composition ──────────────────────────────────────────────────
+  # ── 6. Prometheus + Grafana ───────────────────────────────────────────────
   echo ""
   echo "════════════════════════════════════════════════"
-  echo " 6/7  XRD + Composition"
+  echo " 6/8  Prometheus + Grafana"
+  echo "════════════════════════════════════════════════"
+
+  helm repo add prometheus-community https://prometheus-community.github.io/helm-charts 2>/dev/null || true
+  helm repo update
+
+  echo "==> Installing kube-prometheus-stack in namespace monitoring..."
+  helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
+    --namespace monitoring --create-namespace \
+    --set grafana.adminPassword=admin \
+    --set "grafana.grafana\\.ini.security.allow_embedding=true" \
+    --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false \
+    --wait --timeout 10m
+
+  echo "==> Installing KEDA Prometheus adapter for consumer lag metrics..."
+  # KEDA exposes /metrics on port 8080; scrape via ServiceMonitor
+  kubectl apply -f - <<'YAML'
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: keda-operator
+  namespace: monitoring
+  labels:
+    release: prometheus
+spec:
+  namespaceSelector:
+    matchNames:
+      - keda
+  selector:
+    matchLabels:
+      app: keda-operator
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+YAML
+
+  # ── 7. XRD + Composition ──────────────────────────────────────────────────
+  echo ""
+  echo "════════════════════════════════════════════════"
+  echo " 7/8  XRD + Composition"
   echo "════════════════════════════════════════════════"
 
   echo "==> Applying XRD..."
@@ -295,10 +485,10 @@ YAML
   echo "==> Applying Composition..."
   kubectl apply -f "${REPO_DIR}/crossplane/composition/composition.yaml"
 
-  # ── 7. Argo CD ────────────────────────────────────────────────────────────
+  # ── 8. Argo CD ────────────────────────────────────────────────────────────
   echo ""
   echo "════════════════════════════════════════════════"
-  echo " 7/7  Argo CD"
+  echo " 8/8  Argo CD"
   echo "════════════════════════════════════════════════"
 
   echo "==> Installing Argo CD in namespace argocd..."
@@ -342,11 +532,18 @@ EOF
   echo ""
   echo "  State file : $STATE_FILE"
   echo ""
-  echo "  Next — push to git so Argo CD syncs the claim:"
+  echo "  Next — push to git so Argo CD syncs the claims:"
   echo "    git push origin master"
   echo ""
-  echo "  Or apply the claim directly (bypasses GitOps):"
-  echo "    kubectl apply -f crossplane/claims/"
+  echo "  Argo CD UI (port-forward):"
+  echo "    kubectl port-forward svc/argocd-server -n argocd 8080:443"
+  echo "    open https://localhost:8080"
+  echo "    kubectl get secret argocd-initial-admin-secret -n argocd \\"
+  echo "      -o jsonpath='{.data.password}' | base64 -d"
+  echo ""
+  echo "  Grafana UI (port-forward):"
+  echo "    kubectl port-forward svc/prometheus-grafana -n monitoring 3000:80"
+  echo "    open http://localhost:3000  (admin/admin)"
   echo ""
   echo "  Watch reconciliation:"
   echo "    kubectl get kafkatopiclaims -A"
@@ -383,8 +580,10 @@ cmd_down() {
   echo ""
   echo "==> Will destroy:"
   echo "    Confluent Cloud : env=$ENV_ID  cluster=$CLUSTER_ID  sa=$SA_ID  key=$API_KEY_ID"
+  echo "    Confluent SR    : sr=$SR_ID  sr_key=${SR_API_KEY_ID:-n/a}"
+  echo "    Producer SA     : sa=${PRODUCER_SA_ID:-n/a}  key=${PRODUCER_API_KEY_ID:-n/a}"
   if [[ "$K8S_AVAILABLE" == "true" ]]; then
-    echo "    Kubernetes      : Argo CD, Crossplane, KEDA, Vault, ESO + all managed namespaces"
+    echo "    Kubernetes      : Argo CD, Crossplane, KEDA, Vault, ESO, Prometheus + all managed namespaces"
   else
     echo "    Kubernetes      : SKIPPED (cluster unreachable)"
   fi
@@ -395,26 +594,25 @@ cmd_down() {
   if [[ "$K8S_AVAILABLE" == "true" ]]; then
     # ── 1. Stop Argo CD from re-syncing during teardown ───────────────────────
     echo ""
-    echo "==> [1/6] Removing Argo CD Application (prevents re-sync during teardown)..."
+    echo "==> [1/7] Removing Argo CD Application (prevents re-sync during teardown)..."
     kubectl delete application kafka-as-a-claim -n argocd \
       --ignore-not-found 2>/dev/null || true
 
-    # ── 2. Delete claim and wait for full Crossplane cascade ──────────────────
+    # ── 2. Delete claims and wait for full Crossplane cascade ─────────────────
     # --wait blocks until the claim finalizer clears, which requires the XR to be
     # gone, which requires all composed MRs and Objects to be deleted.
-    # This is the correct gate: only proceed with provider/Crossplane uninstall
-    # once all Object wrappers are confirmed gone — otherwise they get stuck
-    # behind finalizers with no controller running to clear them.
     echo ""
-    echo "==> [2/6] Deleting KafkaTopicClaim and waiting for full cascade (up to 5 min)..."
-    kubectl delete kafkatopiclaims.platform.girishn.cloud orders-events \
-      -n team-payments --ignore-not-found --wait --timeout=5m 2>/dev/null || true
+    echo "==> [2/7] Deleting KafkaTopicClaims and waiting for full cascade (up to 5 min)..."
+    kubectl delete kafkatopiclaims.platform.girishn.cloud shipment-tracking \
+      -n team-logistics --ignore-not-found --wait --timeout=5m 2>/dev/null || true
+    kubectl delete kafkatopiclaims.platform.girishn.cloud delivery-alerts \
+      -n team-operations --ignore-not-found --wait --timeout=5m 2>/dev/null || true
 
     # Belt-and-suspenders: strip finalizers then delete any stuck Confluent MRs.
     # Patch-first is required because the KafkaTopic needs APIKey credentials to
     # call Confluent's REST API on deletion — but the APIKey is deleted first in
     # the cascade, leaving the KafkaTopic finalizer permanently stuck.
-    for CRD in kafkatopics serviceaccounts apikeys rolebindings; do
+    for CRD in kafkatopics serviceaccounts apikeys rolebindings schemas; do
       FULL="${CRD}.confluent.crossplane.io"
       REMAINING=$(kubectl get "$FULL" --all-namespaces --no-headers 2>/dev/null \
         | grep -c '[a-z]' || true)
@@ -430,7 +628,7 @@ cmd_down() {
 
     # ── 3. Remove Crossplane composition layer ────────────────────────────────
     echo ""
-    echo "==> [3/6] Removing Composition, XRD, ProviderConfigs, ClusterSecretStore..."
+    echo "==> [3/7] Removing Composition, XRD, ProviderConfigs, ClusterSecretStore..."
     kubectl delete -f "${REPO_DIR}/crossplane/composition/composition.yaml" \
       --ignore-not-found 2>/dev/null || true
     kubectl delete -f "${REPO_DIR}/crossplane/composition/xrd.yaml" \
@@ -441,10 +639,14 @@ cmd_down() {
       --ignore-not-found 2>/dev/null || true
     kubectl delete secret vault-token -n external-secrets \
       --ignore-not-found 2>/dev/null || true
+    kubectl delete secret confluent-sr-credentials -n "$K8S_NAMESPACE" \
+      --ignore-not-found 2>/dev/null || true
 
     # ── 4. Uninstall Helm releases ────────────────────────────────────────────
     echo ""
-    echo "==> [4/6] Uninstalling Helm releases..."
+    echo "==> [4/7] Uninstalling Helm releases..."
+    helm uninstall prometheus -n monitoring 2>/dev/null \
+      || echo "    Prometheus: not installed, skipping"
     helm uninstall external-secrets -n external-secrets 2>/dev/null \
       || echo "    ESO: not installed, skipping"
     helm uninstall vault -n vault 2>/dev/null \
@@ -458,26 +660,34 @@ cmd_down() {
 
     # ── 5. Delete namespaces ──────────────────────────────────────────────────
     echo ""
-    echo "==> [5/6] Deleting namespaces..."
-    for NS in team-payments external-secrets vault keda argocd "$K8S_NAMESPACE"; do
+    echo "==> [5/7] Deleting namespaces..."
+    for NS in team-logistics team-operations external-secrets vault keda argocd monitoring "$K8S_NAMESPACE"; do
       kubectl delete namespace "$NS" --ignore-not-found 2>/dev/null &
     done
     wait
     echo "    namespace deletions dispatched (finalizers may add a few more seconds)"
   else
     echo ""
-    echo "==> [1-5/6] K8s teardown skipped (cluster unreachable)."
+    echo "==> [1-5/7] K8s teardown skipped (cluster unreachable)."
   fi
 
   # ── 6. Destroy Confluent Cloud ────────────────────────────────────────────
   echo ""
-  echo "==> [6/6] Destroying Confluent Cloud resources..."
+  echo "==> [6/7] Destroying Confluent Cloud resources..."
 
-  echo "    deleting Cloud API key: $API_KEY_ID"
+  echo "    deleting SR API key: ${SR_API_KEY_ID:-n/a}"
+  confluent api-key delete "${SR_API_KEY_ID:-}" --force 2>/dev/null \
+    || echo "    WARN: SR API key may already be deleted — continuing"
+
+  echo "    deleting producer Kafka API key: ${PRODUCER_API_KEY_ID:-n/a}"
+  confluent api-key delete "${PRODUCER_API_KEY_ID:-}" --force 2>/dev/null \
+    || echo "    WARN: Producer API key may already be deleted — continuing"
+
+  echo "    deleting Crossplane Cloud API key: $API_KEY_ID"
   confluent api-key delete "$API_KEY_ID" --force 2>/dev/null \
     || echo "    WARN: API key may already be deleted — continuing"
 
-  echo "    removing EnvironmentAdmin role binding (SA: $SA_ID)"
+  echo "    removing EnvironmentAdmin role binding (Crossplane SA: $SA_ID)"
   confluent iam rbac role-binding delete \
     --principal "User:${SA_ID}" \
     --role EnvironmentAdmin \
@@ -485,7 +695,11 @@ cmd_down() {
     --force 2>/dev/null \
     || echo "    WARN: Role binding may already be removed — continuing"
 
-  echo "    deleting service account: $SA_ID"
+  echo "    deleting producer service account: ${PRODUCER_SA_ID:-n/a}"
+  confluent iam service-account delete "${PRODUCER_SA_ID:-}" --force 2>/dev/null \
+    || echo "    WARN: Producer SA may already be deleted — continuing"
+
+  echo "    deleting Crossplane service account: $SA_ID"
   confluent iam service-account delete "$SA_ID" --force 2>/dev/null \
     || echo "    WARN: Service account may already be deleted — continuing"
 
@@ -507,7 +721,9 @@ cmd_down() {
   confluent environment delete "$ENV_ID" --force 2>/dev/null \
     || echo "    WARN: Environment may already be deleted — continuing"
 
-  echo "==> Removing state file..."
+  # ── 7. Cleanup ────────────────────────────────────────────────────────────
+  echo ""
+  echo "==> [7/7] Removing state file..."
   rm -f "$STATE_FILE"
 
   echo ""
