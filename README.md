@@ -46,6 +46,18 @@ A Kubernetes control loop — driven by Crossplane + Argo CD — turns that clai
 
 ---
 
+## Before vs After
+
+| Metric | Before | After |
+|--------|--------|-------|
+| **Onboarding time** — time to first working workload | 3–5 days (Terraform, RBAC, YAML, reviews) | < 10 minutes (submit claim, git push, done) |
+| **RBAC coverage** — % workloads with scoped bindings | Inconsistent — some topics wide-open | 100% — enforced by Composition |
+| **Config drift** — time to detect and correct | Silent until incident — manual console edits linger | Next reconcile loop — corrected within seconds |
+| **MTTR for Kafka issues** — mean time to resolve | Hours — no trace context, log hunting | Minutes — lag trend + distributed trace |
+| **Platform team toil** — tickets per new workload | 3–7 tickets (topic, RBAC, secrets, review) | 0 tickets — fully self-service |
+
+---
+
 ## Architecture
 
 ```
@@ -248,3 +260,31 @@ See [`docs/FINDINGS.md`](docs/FINDINGS.md) for a full go/no-go assessment coveri
 | Basic tier RBAC | Standard/Dedicated tier → scoped `DeveloperRead`/`DeveloperWrite` per topic |
 | XRD v1 deprecation | Migrate to v2 when Crossplane adds claim support |
 | Cross-cutting platform concerns | Annotation-based controller (separate layer) |
+
+---
+
+## Demo Script
+
+Five beats. Each beat has a before.
+
+### 1. Show the old world
+Open the repo — count the files an app team had to understand and touch before this platform existed: Terraform modules, Confluent provider config, RBAC rules, secret management, reviewer back-and-forth.
+
+### 2. Show the claim
+Open [`crossplane/claims/orders-events.yaml`](crossplane/claims/orders-events.yaml). Five lines of YAML. Everything else — topic creation, RBAC, API key, KEDA scaling, secret delivery — is below the abstraction line. The app team never sees it.
+
+### 3. Git push — show it land *(this is the beat that makes the room go quiet)*
+```bash
+git push origin master
+```
+Switch to the Argo CD UI — watch it sync. Switch to the Confluent Cloud console — the topic and RBAC appear live. No `kubectl apply`. No Terraform run. No ticket.
+
+### 4. Break it manually — show it self-heal
+In the Confluent Cloud console, manually edit the RoleBinding or delete the topic. Watch Crossplane detect the drift and correct it within seconds — without any human intervention.
+
+### 5. Show the observability proof
+Pull up the KEDA ScaledObject:
+```bash
+kubectl get scaledobject payments-consumer -n team-payments -o jsonpath='{.spec.maxReplicaCount}'
+```
+The value came from the live partition count on Confluent Cloud — not a hardcoded number. The claim is the single source of truth: change `spec.partitions`, and both the Confluent topic and the KEDA ceiling update together.
