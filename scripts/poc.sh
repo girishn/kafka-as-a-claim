@@ -647,6 +647,24 @@ cmd_down() {
     # Patch-first is required because the KafkaTopic needs APIKey credentials to
     # call Confluent's REST API on deletion — but the APIKey is deleted first in
     # the cascade, leaving the KafkaTopic finalizer permanently stuck.
+    #
+    # Stripping a finalizer prevents the provider from calling Confluent's delete
+    # API, so any resource still present here will be orphaned in Confluent Cloud.
+    # Capture names BEFORE stripping so we can clean them up explicitly afterward.
+    ORPHAN_SA_NAMES=()
+    while IFS= read -r name; do
+      [[ -n "$name" ]] && ORPHAN_SA_NAMES+=("$name")
+    done < <(kubectl get serviceaccounts.confluent.crossplane.io -A \
+      -o jsonpath='{range .items[*]}{.spec.forProvider.displayName}{"\n"}{end}' \
+      2>/dev/null || true)
+
+    ORPHAN_TOPIC_NAMES=()
+    while IFS= read -r name; do
+      [[ -n "$name" ]] && ORPHAN_TOPIC_NAMES+=("$name")
+    done < <(kubectl get kafkatopics.confluent.crossplane.io -A \
+      -o jsonpath='{range .items[*]}{.spec.forProvider.topicName}{"\n"}{end}' \
+      2>/dev/null || true)
+
     for CRD in kafkatopics serviceaccounts apikeys rolebindings schemas; do
       FULL="${CRD}.confluent.crossplane.io"
       REMAINING=$(kubectl get "$FULL" --all-namespaces --no-headers 2>/dev/null \
@@ -660,6 +678,32 @@ cmd_down() {
           --ignore-not-found 2>/dev/null || true
       fi
     done
+
+    # Explicitly delete Confluent Cloud resources orphaned by finalizer stripping
+    if [[ ${#ORPHAN_SA_NAMES[@]} -gt 0 ]]; then
+      echo "    cleaning up Confluent Cloud SAs orphaned by finalizer strip..."
+      for SA_DN in "${ORPHAN_SA_NAMES[@]}"; do
+        SA_ID=$(confluent iam service-account list --output json 2>/dev/null | \
+          jq -r --arg n "$SA_DN" '.[] | select(.name == $n or .display_name == $n) | .id' \
+          | head -1 || true)
+        if [[ -n "$SA_ID" && "$SA_ID" != "null" ]]; then
+          echo "    deleting orphaned SA: $SA_DN ($SA_ID)"
+          confluent iam service-account delete "$SA_ID" --force 2>/dev/null \
+            || echo "    WARN: SA $SA_DN may already be deleted — continuing"
+        fi
+      done
+    fi
+
+    if [[ ${#ORPHAN_TOPIC_NAMES[@]} -gt 0 && -n "${CLUSTER_ID:-}" && -n "${ENV_ID:-}" ]]; then
+      echo "    cleaning up Kafka topics orphaned by finalizer strip..."
+      for TOPIC_NAME in "${ORPHAN_TOPIC_NAMES[@]}"; do
+        echo "    deleting topic: $TOPIC_NAME"
+        confluent kafka topic delete "$TOPIC_NAME" \
+          --environment "$ENV_ID" \
+          --cluster "$CLUSTER_ID" --force 2>/dev/null \
+          || echo "    WARN: topic $TOPIC_NAME not found — continuing"
+      done
+    fi
 
     # ── 3. Remove Crossplane composition layer ────────────────────────────────
     echo ""

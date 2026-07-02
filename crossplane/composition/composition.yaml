@@ -39,12 +39,12 @@
 #
 # Confluent Cloud constants embedded here — auto-patched by poc.sh up via sed:
 #   ORG_ID:           35eebd08-f76f-428a-83c9-e8a2dc4c9bae
-#   ENV_ID:           env-66xmmj
-#   CLUSTER_ID:       lkc-81165pr
+#   ENV_ID:           env-0623d2
+#   CLUSTER_ID:       lkc-222k7p2
 #   REST_ENDPOINT:    https://pkc-oxqxx9.us-east-1.aws.confluent.cloud:443
 #   BOOTSTRAP:        pkc-oxqxx9.us-east-1.aws.confluent.cloud:9092
-#   SR_CLUSTER_ID:    lsrc-placeholder
-#   SR_REST_ENDPOINT: https://psrc-placeholder.confluent.cloud
+#   SR_CLUSTER_ID:    lsrc-0xxknq9
+#   SR_REST_ENDPOINT: https://psrc-4m2v5xk.us-east-1.aws.confluent.cloud
 apiVersion: apiextensions.crossplane.io/v1
 kind: Composition
 metadata:
@@ -97,11 +97,11 @@ spec:
                       idSelector:
                         matchControllerRef: true
                   managedResource:
-                    - id: "lkc-81165pr"
+                    - id: "lkc-222k7p2"
                       apiVersion: "cmk/v2"
                       kind: "Cluster"
                       environment:
-                        - id: "env-66xmmj"
+                        - id: "env-0623d2"
                 writeConnectionSecretToRef:
                   namespace: crossplane-system
                   name: ""
@@ -135,7 +135,7 @@ spec:
               spec:
                 forProvider:
                   roleName: "CloudClusterAdmin"
-                  crnPattern: "crn://confluent.cloud/organization=35eebd08-f76f-428a-83c9-e8a2dc4c9bae/environment=env-66xmmj/cloud-cluster=lkc-81165pr"
+                  crnPattern: "crn://confluent.cloud/organization=35eebd08-f76f-428a-83c9-e8a2dc4c9bae/environment=env-0623d2/cloud-cluster=lkc-222k7p2"
                   principalSelector:
                     matchControllerRef: true
                 providerConfigRef:
@@ -157,7 +157,7 @@ spec:
                   partitionsCount: 6
                   restEndpoint: "https://pkc-oxqxx9.us-east-1.aws.confluent.cloud:443"
                   kafkaCluster:
-                    - id: "lkc-81165pr"
+                    - id: "lkc-222k7p2"
                   credentials:
                     - keySecretRef:
                         namespace: crossplane-system
@@ -362,6 +362,9 @@ spec:
                       policyTypes:
                         - Egress
                       egress:
+                        - ports:
+                            - protocol: UDP
+                              port: 53
                         - ports:
                             - protocol: TCP
                               port: 9092
@@ -588,8 +591,8 @@ spec:
                   format: "AVRO"
                   schema: ""
                   schemaRegistryCluster:
-                    - id: "lsrc-placeholder"
-                  restEndpoint: "https://psrc-placeholder.confluent.cloud"
+                    - id: "lsrc-0xxknq9"
+                  restEndpoint: "https://psrc-4m2v5xk.us-east-1.aws.confluent.cloud"
                   credentials:
                     - keySecretRef:
                         namespace: crossplane-system
