@@ -1,0 +1,12 @@
+apiVersion: platform.girishn.cloud/v1alpha1
+kind: KafkaTopicClaim
+metadata:
+  name: shipment-tracking
+  namespace: team-logistics
+spec:
+  topicName: shipments.events
+  partitions: 6
+  consumerName: tracking-consumer
+  valueSchema: shipments.events-value
+  schemaBody: >-
+    {"type":"record","name":"ShipmentEvent","namespace":"com.logistics.events","fields":[{"name":"shipment_id","type":"string"},{"name":"status","type":"string"},{"name":"origin","type":"string"},{"name":"destination","type":"string"},{"name":"carrier","type":"string"},{"name":"timestamp","type":"long"}]}
